@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+playground/
+.github/copilot-instructions.md
+.env
+loop_agent_guide.md

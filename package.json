@@ -1,0 +1,27 @@
+{
+  "name": "shrimp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "🍤 小虾米 - A fully browser-based multi-provider AI workspace with SOUL personality, Skills, encrypted storage, and GitHub Actions integration.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^3.1.0",
+    "@google/genai": "^1.43.0",
+    "@langchain/core": "^0.3.17",
+    "@langchain/google-genai": "^0.1.12",
+    "@langchain/langgraph": "^0.2.0",
+    "highlight.js": "^11.9.0",
+    "marked": "^15.0.0",
+    "pushoo": "^0.1.12",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "telegraf": "^4.16.3",
+    "vite": "^6.0.0"
+  }
+}
