@@ -68,6 +68,15 @@ class UpstashClient {
     const res = await this._cmd(['DEL', key]);
     return res.result;
   }
+
+  /**
+   * Verify Upstash connectivity by issuing a PING command.
+   * Returns true if connected, throws on failure.
+   */
+  async ping() {
+    const res = await this._cmd(['PING']);
+    return res.result === 'PONG';
+  }
 }
 
 // ─── File Encryption (AES-256-GCM, PBKDF2) ────────────────────────
@@ -382,11 +391,6 @@ function createBuiltinTools(repoStore) {
 
   // 3b. Run Shell — execute a shell command (bash)
   tools.push(tool(async ({ command }) => {
-    // Guard: reject obvious Python/JS code passed as shell command
-    const pythonPatterns = /^(import |from \w+ import |def |class |print\()/m;
-    if (pythonPatterns.test(command) && !command.startsWith('python')) {
-      return 'Error: This looks like Python code, not a bash command. Use run_shell with: python3 -c \'your_code\' or use fetch_url for HTTP API calls instead.';
-    }
     try {
       const { execSync } = require('child_process');
       const output = execSync(command, {
@@ -405,8 +409,8 @@ function createBuiltinTools(repoStore) {
     }
   }, {
     name: 'run_shell',
-    description: 'Execute a BASH shell command. This is /bin/bash — do NOT pass Python code directly. For HTTP API calls, PREFER using fetch_url tool instead (it supports custom headers, methods, and body). Only use run_shell for: curl commands, git, file operations, apt-get, or other CLI tools. For Python scripts, wrap with: python3 -c "code". Timeout: 30s.',
-    schema: z.object({ command: z.string().describe('A bash command, e.g. "curl -s -H \'Authorization: Bearer token\' https://api.example.com/data"') }),
+    description: 'Execute a BASH shell command (/bin/bash). Supports any command including Python, Node.js, curl, git, file operations, package managers, etc. For HTTP API calls, fetch_url is preferred. Timeout: 30s, max output: 8000 chars.',
+    schema: z.object({ command: z.string().describe('A bash command, e.g. "curl -s -H \'Authorization: Bearer token\' https://api.example.com/data" or "python3 script.py"') }),
   }));
 
   // 4. Current DateTime — returns current date and time
@@ -513,6 +517,178 @@ function createBuiltinTools(repoStore) {
     }));
   }
 
+  // 9. Unified Skill Search — searches both built-in catalog AND ClawHub
+  tools.push(tool(async ({ query }) => {
+    try {
+      const terms = query.toLowerCase().split(/[\s,]+/).filter(Boolean);
+      const results = [];
+
+      // Search built-in catalog
+      for (const skill of BUILTIN_SKILLS) {
+        const haystack = [skill.name, skill.description, ...skill.keywords].join(' ').toLowerCase();
+        if (terms.some(t => haystack.includes(t))) {
+          results.push({
+            name: skill.name,
+            icon: skill.icon,
+            description: skill.description,
+            loaded: _skillRouter.has(skill.name),
+            source: 'builtin',
+          });
+        }
+      }
+
+      // Search ClawHub (non-blocking: if it fails, we still return builtin results)
+      try {
+        const chUrl = `https://clawhub.ai/api/v1/search?q=${encodeURIComponent(query)}&type=skill`;
+        const resp = await fetch(chUrl, {
+          headers: { 'User-Agent': 'LittleShrimp-LoopAgent/1.0' },
+          signal: AbortSignal.timeout(10000),
+        });
+        if (resp.ok) {
+          const body = await resp.json();
+          for (const r of (body.results || []).slice(0, 5)) {
+            results.push({
+              name: r.displayName || r.slug,
+              slug: r.slug,
+              icon: '🔌',
+              description: (r.summary || '').slice(0, 150),
+              loaded: _skillRouter.has(r.displayName || r.slug),
+              source: 'clawhub',
+              score: r.score,
+            });
+          }
+        }
+      } catch { /* ClawHub unreachable — continue with builtin results */ }
+
+      if (results.length === 0) {
+        return `No skills found matching "${query}".\nBuilt-in skills: ${BUILTIN_SKILLS.map(s => `${s.icon} ${s.name}`).join(', ')}`;
+      }
+
+      const lines = results.map(r => {
+        const status = r.loaded ? '✅ loaded' : '📦 available';
+        const src = r.source === 'clawhub' ? `[clawhub: ${r.slug}]` : '[builtin]';
+        return `${r.icon} ${r.name} ${src} [${status}] — ${r.description}`;
+      });
+      return `Found ${results.length} skill(s):\n${lines.join('\n')}\n\nTo load a skill, call load_skill with the skill name (for builtin), a ClawHub slug, or a direct URL.`;
+    } catch (e) {
+      return `Skill search failed: ${e.message}`;
+    }
+  }, {
+    name: 'search_skills',
+    description: 'Search for skills across built-in catalog AND ClawHub community registry. Returns matching skills with load status. Use this when current tools cannot complete a task.',
+    schema: z.object({ query: z.string().describe('Search keywords, e.g. "email send" or "translate language"') }),
+  }));
+
+  // 10. Unified Skill Loader — loads a skill from URL, builtin name, or ClawHub slug
+  tools.push(tool(async ({ source }) => {
+    try {
+      let url, name, skillSource;
+
+      // 1. Direct URL
+      if (source.startsWith('http://') || source.startsWith('https://')) {
+        url = source;
+        name = source.split('/').pop().replace(/\.[^.]+$/, '') || 'custom-skill';
+        skillSource = 'url';
+      }
+      // 2. Built-in skill name
+      else {
+        const builtin = BUILTIN_SKILLS.find(s =>
+          s.name.toLowerCase() === source.toLowerCase()
+        );
+        if (builtin) {
+          url = SKILLS_BASE_URL + builtin.file;
+          name = builtin.name;
+          skillSource = 'builtin';
+        } else {
+          // 3. Try as ClawHub slug — fetch content from ClawHub API
+          const chUrl = `https://clawhub.ai/api/v1/skills/${encodeURIComponent(source)}/content`;
+          try {
+            const resp = await fetch(chUrl, {
+              headers: { 'User-Agent': 'LittleShrimp-LoopAgent/1.0' },
+              signal: AbortSignal.timeout(15000),
+            });
+            if (resp.ok) {
+              const content = await resp.text();
+              const nameMatch = content.match(/^#\s*(.+)/m) || content.match(/name:\s*(.+)/im);
+              name = nameMatch ? nameMatch[1].trim() : source;
+              if (_skillRouter.has(name)) return `ℹ️ Skill "${name}" is already loaded.`;
+              const entry = _skillRouter.register({
+                name, source: 'clawhub', url: chUrl, content: content.slice(0, 6000),
+              });
+              return `✅ Skill "${name}" loaded from ClawHub.\nTriggers: ${entry.triggers.join(', ')}\nThe skill will be active for matching tasks.`;
+            }
+          } catch { /* fall through */ }
+
+          return `❌ Skill "${source}" not found. Provide a full URL, a built-in skill name, or a ClawHub slug.\nBuilt-in skills: ${BUILTIN_SKILLS.map(s => s.name).join(', ')}`;
+        }
+      }
+
+      // Check if already loaded
+      if (_skillRouter.has(name)) return `ℹ️ Skill "${name}" is already loaded.`;
+
+      // Fetch and register
+      const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const content = await resp.text();
+
+      // Try to extract a better name from content
+      const nameMatch = content.match(/^#\s*(.+)/m) || content.match(/name:\s*(.+)/im);
+      if (nameMatch) name = nameMatch[1].trim();
+
+      if (_skillRouter.has(name)) return `ℹ️ Skill "${name}" is already loaded.`;
+
+      const entry = _skillRouter.register({
+        name, source: skillSource, url, content: content.slice(0, 6000),
+      });
+      return `✅ Skill "${name}" loaded from ${skillSource}.\nTriggers: ${entry.triggers.join(', ')}\nThe skill will be active for matching tasks.`;
+    } catch (e) {
+      return `❌ Failed to load skill: ${e.message}`;
+    }
+  }, {
+    name: 'load_skill',
+    description: 'Load a skill by URL, built-in name, or ClawHub slug. The skill will be automatically activated for matching tasks via the skill router. Sources: direct URL (any .txt/.md skill file), built-in name (e.g. "Code Review"), or ClawHub slug (e.g. "email-daily-summary").',
+    schema: z.object({
+      source: z.string().describe('URL, built-in skill name, or ClawHub slug'),
+    }),
+  }));
+
+  // 11. ClawHub Skill Detail — inspect a skill before loading
+  tools.push(tool(async ({ slug }) => {
+    try {
+      const url = `https://clawhub.ai/api/v1/skills/${encodeURIComponent(slug)}`;
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'LittleShrimp-LoopAgent/1.0' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (resp.status === 404) return `Skill "${slug}" not found on ClawHub.`;
+      if (!resp.ok) return `ClawHub detail failed: HTTP ${resp.status}`;
+      const body = await resp.json();
+      const s = body.skill || {};
+      const v = body.latestVersion || {};
+      const owner = body.owner || {};
+      const mod = body.moderation || {};
+      const loaded = _skillRouter.has(s.displayName || s.slug);
+      const lines = [
+        `**${s.displayName || s.slug}** (${s.slug}) ${loaded ? '✅ loaded' : '📦 available'}`,
+        `Summary: ${s.summary || 'N/A'}`,
+        `Version: ${v.version || 'N/A'}`,
+        `Author: ${owner.handle || 'unknown'}`,
+        `Downloads: ${s.stats?.downloads || 0} | Stars: ${s.stats?.stars || 0}`,
+        `Safety: ${mod.verdict || 'unknown'}${mod.summary ? ' — ' + mod.summary : ''}`,
+        v.changelog ? `Changelog: ${v.changelog.slice(0, 300)}` : '',
+        `URL: https://clawhub.ai/skills/${s.slug}`,
+        loaded ? '' : `\nTo load: call load_skill with slug "${s.slug}"`,
+      ].filter(Boolean);
+      return lines.join('\n');
+    } catch (e) {
+      return `ClawHub detail failed: ${e.message}`;
+    }
+  }, {
+    name: 'clawhub_skill_detail',
+    description: 'Get detailed information about a specific ClawHub skill by slug. Inspect safety, author, stats before loading. Use load_skill to actually load a skill.',
+    schema: z.object({ slug: z.string().describe('The skill slug, e.g. "email-daily-summary"') }),
+  }));
+
   return tools;
 }
 
@@ -572,7 +748,7 @@ function createInitialState() {
     _waitRounds: 0,
 
     // Extensions (skills/soul)
-    _loadedSkills: [],
+    _skills: [],           // SkillRouter serialized data
     _loadedSoul: null,
 
     // Node execution history — records every node transition
@@ -758,7 +934,6 @@ class AgentGraph {
     this.systemPrompt = systemPrompt;
     this._repoStore = repoStore || null;
     this._tools = tools;
-    this._loadedSkills = [];   // [{ name, url, content }]
     this._loadedSoul = null;   // { name, url, content } or null
     this._checkpointer = checkpointer || null;
     this._threadId = threadId || '';
@@ -766,7 +941,11 @@ class AgentGraph {
     this._rebuildExecutor();
   }
 
-  /** Rebuild the ReAct executor with current skills/soul applied to prompt. */
+  /**
+   * Rebuild the ReAct executor. Only called when soul changes.
+   * Skills are NOT baked into the base prompt — they are injected
+   * per-message in _execute() via the SkillRouter for isolation.
+   */
   _rebuildExecutor() {
     const { createReactAgent } = require('@langchain/langgraph/prebuilt');
     const defaultPrompt = `You are a helpful AI assistant running as a persistent loop agent in GitHub Actions.
@@ -779,6 +958,18 @@ Available tools:
 - current_datetime: Get current time.
 - read_repo_file / write_repo_file: Read/write files in the GitHub repo.
 - save_memory / read_memory: Persistent key-value memory across conversations.
+- search_skills: Unified search across built-in skill catalog AND ClawHub community registry. Use when current tools cannot complete a task.
+- load_skill: Load a skill by URL, built-in name, or ClawHub slug. Skills are activated automatically via the skill router.
+- clawhub_skill_detail: Inspect a ClawHub skill's safety, author, and changelog before loading.
+
+SKILL SYSTEM:
+You can extend your capabilities by loading skills. Skills are managed by a router that prevents conflicts.
+- If you cannot complete a task with current tools, call search_skills to find relevant skills.
+- Use load_skill to load a skill directly (by URL, built-in name, or ClawHub slug).
+- Loaded skills are automatically activated for matching tasks — no manual approval needed.
+- clawhub_skill_detail lets you inspect a skill before loading it.
+- NEVER refuse a task without first searching for available skills.
+- Skills are isolated: each skill only applies to its relevant domain.
 
 CRITICAL RULES:
 1. ALWAYS use your tools to take action. NEVER output code blocks as text — USE the tools directly.
@@ -793,54 +984,64 @@ CRITICAL RULES:
 
 User commands (slash commands):
 - /memory clear — Clear the persistent memory file
-- /skill load <url> — Load a skill from URL
+- /skill load <url|name|slug> — Load a skill from URL, built-in name, or ClawHub slug
 - /skill unload <name> — Unload a skill by name
-- /skill list — List loaded skills
+- /skill list — List loaded skills with source and trigger info
+- /skill search <query> — Search for skills in built-in catalog
 - /soul load <name_or_url> — Load a personality/soul
 - /soul unload — Unload current soul
 - /soul list — List available built-in souls`;
 
     let prompt = defaultPrompt;
 
-    // Append loaded soul
+    // Append loaded soul (soul is part of the base prompt, not per-message)
     if (this._loadedSoul) {
       prompt += `\n\n[Active Soul: ${this._loadedSoul.name}]\n${this._loadedSoul.content}`;
     }
 
-    // Append loaded skills
-    if (this._loadedSkills.length > 0) {
-      prompt += `\n\n[Active Skills]`;
-      for (const skill of this._loadedSkills) {
-        prompt += `\n\n--- Skill: ${skill.name} ---\n${skill.content}`;
-      }
-    }
+    // NOTE: Skills are NOT injected here. They are injected per-message
+    // in _execute() via the SkillRouter for proper isolation.
 
     if (this.systemPrompt) {
       prompt += `\n\nAdditional instructions:\n${this.systemPrompt}`;
     }
 
     this.executor = createReactAgent({ llm: this.llm, tools: this._tools, messageModifier: prompt });
-    console.log(`[Graph] Executor rebuilt. Soul: ${this._loadedSoul?.name || 'none'}, Skills: ${this._loadedSkills.map(s => s.name).join(', ') || 'none'}`);
+    const skillCount = _skillRouter.listAll().length;
+    console.log(`[Graph] Executor rebuilt. Soul: ${this._loadedSoul?.name || 'none'}, Skills in router: ${skillCount}`);
   }
 
   /** Restore skills/soul state from persisted State */
   restoreExtensions(state) {
-    if (state._loadedSkills?.length > 0) {
-      this._loadedSkills = state._loadedSkills;
-      console.log(`[Graph] Restored ${this._loadedSkills.length} skills from state`);
+    // Restore skills into SkillRouter (new format)
+    if (state._skills?.length > 0) {
+      _skillRouter.fromJSON(state._skills);
+      console.log(`[Graph] Restored ${_skillRouter.listAll().length} skills from state`);
     }
+    // Backward compatibility: old _loadedSkills format → migrate to router
+    else if (state._loadedSkills?.length > 0) {
+      for (const s of state._loadedSkills) {
+        _skillRouter.register({
+          name: s.name, source: 'url', url: s.url, content: s.content,
+        });
+      }
+      console.log(`[Graph] Migrated ${state._loadedSkills.length} skills from legacy format`);
+    }
+
     if (state._loadedSoul) {
       this._loadedSoul = state._loadedSoul;
       console.log(`[Graph] Restored soul: ${this._loadedSoul.name}`);
     }
-    if (this._loadedSkills.length > 0 || this._loadedSoul) {
+
+    // Rebuild only if soul changed (skills don't need rebuild)
+    if (this._loadedSoul) {
       this._rebuildExecutor();
     }
   }
 
   /** Save current skill/soul state into State for persistence */
   _syncExtensionsToState(state) {
-    state._loadedSkills = this._loadedSkills;
+    state._skills = _skillRouter.toJSON();
     state._loadedSoul = this._loadedSoul;
   }
 
@@ -859,6 +1060,8 @@ User commands (slash commands):
   async process(userText, state, conversationMessages) {
     state.turnCount = (state.turnCount || 0) + 1;
     state.lastError = null;
+    // Store current user text for per-message skill routing in _execute()
+    state._currentUserText = userText;
     const phase = state.phase || 'analyze';
     console.log(`\n[Graph] ═══ Turn #${state.turnCount} ═══ Phase: ${phase}, input: ${userText.length} chars`);
 
@@ -914,6 +1117,9 @@ Available tools (these are REAL tools you can call in the execution phase):
 - current_datetime: Get current date and time
 - read_repo_file / write_repo_file: Read/write files in the GitHub repository
 - save_memory / read_memory: Persistent memory storage
+- search_skills: Unified search across built-in skills and ClawHub community registry
+- load_skill: Load a skill by URL, built-in name, or ClawHub slug
+- clawhub_skill_detail: Get full details for a ClawHub skill by slug
 
 Classify the request:
 1. "direct" — Can be handled with the available tools above. This includes:
@@ -1153,6 +1359,20 @@ Respond with ONLY valid JSON (no markdown):
       ];
     }
 
+    // Per-message skill routing: inject only relevant skills for the current task.
+    // This prevents unrelated skills from interfering with each other.
+    const currentUserText = state._currentUserText || '';
+    const matchedSkills = _skillRouter.match(currentUserText);
+    if (matchedSkills.length > 0) {
+      const skillSection = _skillRouter.buildPromptSection(matchedSkills);
+      execMessages = [
+        new HumanMessage(`${skillSection}\nApply the relevant skill instructions for the current task. Each <skill> section is independent — do not mix instructions from different skills.`),
+        new AIMessage('Understood. I will apply the matching skill instructions for the current task.'),
+        ...execMessages,
+      ];
+      console.log(`[Graph] Skill Router: injected ${matchedSkills.length} skill(s): ${matchedSkills.map(s => s.name).join(', ')}`);
+    }
+
     let result;
     try {
       result = await this.executor.invoke(
@@ -1338,6 +1558,177 @@ const BUILTIN_SOULS = [
 ];
 const SOULS_BASE_URL = 'https://raw.githubusercontent.com/masteraux101/little_shrimp/main/examples/souls/';
 
+// ─── Built-in Skills Catalog (matches examples/skills/) ────────────────
+
+const BUILTIN_SKILLS = [
+  { name: 'Code Review', file: 'code-review.txt', icon: '🔍', description: 'Systematic code review with actionable feedback', keywords: ['code', 'review', 'lint', 'quality'] },
+  { name: 'Translator', file: 'translator.txt', icon: '🌐', description: 'Multi-language translation with cultural context', keywords: ['translate', 'language', 'i18n', 'localize'] },
+  { name: 'Email via Resend', file: 'email-resend.txt', icon: '📧', description: 'Send transactional emails using the Resend API', keywords: ['email', 'mail', 'send', 'resend', 'notification'] },
+  { name: 'Web Scraper', file: 'web-scraper.txt', icon: '🕷️', description: 'Generate Python scripts to scrape and extract web data', keywords: ['scrape', 'crawl', 'extract', 'web', 'html', 'parse'] },
+  { name: 'Data Visualization', file: 'data-visualization.txt', icon: '📈', description: 'Create charts and visualizations with matplotlib', keywords: ['chart', 'graph', 'plot', 'visualize', 'data', 'matplotlib'] },
+  { name: 'Summary & Digest', file: 'summary-digest.txt', icon: '📋', description: 'Summarize texts, articles, and documents into concise digests', keywords: ['summary', 'summarize', 'digest', 'tldr', 'brief'] },
+  { name: 'Writing Polish', file: 'writing-polish.txt', icon: '✏️', description: 'Improve writing quality — grammar, clarity, tone, style', keywords: ['write', 'grammar', 'polish', 'edit', 'proofread', 'style'] },
+  { name: 'JSON/API Helper', file: 'json-api-helper.txt', icon: '🔧', description: 'Parse, transform JSON and design REST APIs', keywords: ['json', 'api', 'rest', 'parse', 'transform'] },
+  { name: 'AI Prompt Scheduler', file: 'ai-prompt-scheduler.txt', icon: '⏰', description: 'Schedule AI prompts to run at specified times', keywords: ['schedule', 'cron', 'timer', 'automate', 'prompt'] },
+  { name: 'GitHub Scheduler', file: 'github-scheduler.txt', icon: '📅', description: 'Schedule GitHub Actions workflows', keywords: ['github', 'action', 'schedule', 'workflow', 'cron'] },
+];
+const SKILLS_BASE_URL = 'https://raw.githubusercontent.com/masteraux101/little_shrimp/main/examples/skills/';
+
+// ─── Skill Router ─────────────────────────────────────────────────
+//
+// Central registry that manages all loaded skills with isolation.
+// Skills from different sources (URL, built-in catalog, ClawHub)
+// go through a unified pipeline. The router selects only relevant
+// skills per-message to prevent interference between unrelated skills.
+
+class SkillRouter {
+  constructor() {
+    this._skills = new Map(); // lowercase name → SkillEntry
+  }
+
+  /**
+   * Register a skill.
+   * @param {{ name, source, url, content, triggers?: string[] }} skill
+   * @returns {object} The registered entry
+   */
+  register(skill) {
+    const entry = {
+      name: skill.name,
+      source: skill.source || 'url',       // 'url' | 'builtin' | 'clawhub'
+      url: skill.url || '',
+      content: skill.content || '',
+      triggers: skill.triggers || this._extractTriggers(skill.name, skill.content),
+      loadedAt: Date.now(),
+    };
+    this._skills.set(skill.name.toLowerCase(), entry);
+    return entry;
+  }
+
+  /** Unregister a skill by name. Returns true if removed. */
+  unregister(name) {
+    return this._skills.delete(name.toLowerCase());
+  }
+
+  /** Check if a skill is loaded. */
+  has(name) {
+    return this._skills.has(name.toLowerCase());
+  }
+
+  /** Get a skill entry by name. */
+  get(name) {
+    return this._skills.get(name.toLowerCase());
+  }
+
+  /** Get all registered skills as an array. */
+  listAll() {
+    return Array.from(this._skills.values());
+  }
+
+  /** Get loaded skill names as a Set. */
+  getLoadedNames() {
+    return new Set(Array.from(this._skills.keys()));
+  }
+
+  /**
+   * Match relevant skills for a given user message.
+   * Returns skills ordered by relevance (highest trigger matches first).
+   * Skills with no triggers are always included (catch-all).
+   */
+  match(userText) {
+    if (this._skills.size === 0) return [];
+    if (!userText) return this.listAll(); // no context → include all
+
+    const text = userText.toLowerCase();
+    const matched = [];
+
+    for (const skill of this._skills.values()) {
+      if (!skill.triggers || skill.triggers.length === 0) {
+        // Catch-all skill: always included with lowest priority
+        matched.push({ ...skill, _matchScore: 0 });
+        continue;
+      }
+      const score = skill.triggers.reduce((acc, trigger) => {
+        return acc + (text.includes(trigger) ? 1 : 0);
+      }, 0);
+      if (score > 0) {
+        matched.push({ ...skill, _matchScore: score });
+      }
+    }
+
+    // If no specific matches, include all skills (user might not mention keywords)
+    if (matched.length === 0) return this.listAll();
+
+    // Sort by match score descending
+    matched.sort((a, b) => b._matchScore - a._matchScore);
+    return matched;
+  }
+
+  /**
+   * Build the skill prompt section for matched skills.
+   * Each skill is clearly delimited with XML-style tags for isolation.
+   */
+  buildPromptSection(matchedSkills) {
+    if (!matchedSkills || matchedSkills.length === 0) return '';
+    const sections = matchedSkills.map(skill => {
+      return `<skill name="${skill.name}" source="${skill.source}">\n${skill.content}\n</skill>`;
+    });
+    return `[Active Skills — ${matchedSkills.length} skill(s) matched]\n` +
+      `IMPORTANT: Each <skill> section below is independent. Only follow a skill's instructions when the current task matches that skill's domain. Do NOT mix instructions from different skills.\n\n` +
+      sections.join('\n\n');
+  }
+
+  /**
+   * Extract trigger keywords from skill name and content.
+   * Looks for explicit @triggers annotation first, then falls back
+   * to extracting meaningful words from the name and heading.
+   */
+  _extractTriggers(name, content) {
+    // Check for explicit @triggers annotation
+    if (content) {
+      const triggerMatch = content.match(/@triggers?:\s*(.+)/i);
+      if (triggerMatch) {
+        return triggerMatch[1].split(/[,;]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+      }
+    }
+    // Fall back: extract from name
+    const stopWords = new Set(['the', 'and', 'for', 'with', 'via', 'from', 'into', 'using']);
+    const triggers = name.toLowerCase()
+      .split(/[\s\-_]+/)
+      .filter(t => t.length > 2 && !stopWords.has(t));
+    // Also extract from first heading in content
+    if (content) {
+      const headingMatch = content.match(/^#\s*(.+)/m);
+      if (headingMatch) {
+        const headingWords = headingMatch[1].toLowerCase()
+          .split(/[\s\-_:]+/)
+          .filter(t => t.length > 2 && !stopWords.has(t));
+        triggers.push(...headingWords);
+      }
+    }
+    return [...new Set(triggers)];
+  }
+
+  /** Serialize for state persistence. */
+  toJSON() {
+    return this.listAll().map(({ name, source, url, content, triggers }) => ({
+      name, source, url, content, triggers,
+    }));
+  }
+
+  /** Restore from persisted state. */
+  fromJSON(arr) {
+    this._skills.clear();
+    if (Array.isArray(arr)) {
+      for (const item of arr) {
+        this.register(item);
+      }
+    }
+  }
+}
+
+// Module-level router instance (shared by tools & AgentGraph)
+const _skillRouter = new SkillRouter();
+
 /**
  * Handle slash commands from the user.
  * Returns { handled: true, responseText } if it was a command, or { handled: false } otherwise.
@@ -1360,39 +1751,86 @@ async function handleSlashCommand(text, { agentGraph, graphState, repoStore }) {
 
   // ── /skill list ──
   if (lower === '/skill list') {
-    const skills = agentGraph._loadedSkills;
+    const skills = _skillRouter.listAll();
     if (skills.length === 0) {
-      return { handled: true, responseText: 'No skills loaded.\n\nUse `/skill load <url>` to load a skill.' };
+      return { handled: true, responseText: 'No skills loaded.\n\nUse `/skill load <url | name | slug>` to load a skill.' };
     }
     const lines = ['**Loaded Skills:**\n'];
     for (const s of skills) {
-      lines.push(`- **${s.name}** — ${s.url}`);
+      lines.push(`- **${s.name}** [${s.source}] — triggers: ${s.triggers.join(', ')}`);
     }
     lines.push(`\nUse \`/skill unload <name>\` to remove a skill.`);
     return { handled: true, responseText: lines.join('\n') };
   }
 
-  // ── /skill load <url> ──
+  // ── /skill search <query> ──
+  if (lower.startsWith('/skill search ')) {
+    const query = cmd.slice('/skill search '.length).trim();
+    if (!query) return { handled: true, responseText: '⚠️ Usage: `/skill search <keywords>`' };
+    const terms = query.toLowerCase().split(/[\s,]+/).filter(Boolean);
+    const results = [];
+    for (const skill of BUILTIN_SKILLS) {
+      const haystack = [skill.name, skill.description, ...skill.keywords].join(' ').toLowerCase();
+      if (terms.some(t => haystack.includes(t))) {
+        const loaded = _skillRouter.has(skill.name);
+        results.push(`${skill.icon} **${skill.name}** [builtin] ${loaded ? '✅' : '📦'} — ${skill.description}`);
+      }
+    }
+    if (results.length === 0) {
+      return { handled: true, responseText: `No built-in skills match "${query}". Available: ${BUILTIN_SKILLS.map(s => `${s.icon} ${s.name}`).join(', ')}` };
+    }
+    return { handled: true, responseText: `**Skill Search: "${query}"**\n\n${results.join('\n')}\n\nUse \`/skill load <name>\` to load.` };
+  }
+
+  // ── /skill load <url | builtin_name | clawhub_slug> ──
   if (lower.startsWith('/skill load ')) {
-    const url = cmd.slice('/skill load '.length).trim();
-    if (!url || !url.startsWith('http')) {
-      return { handled: true, responseText: '⚠️ Usage: `/skill load <url>`\n\nProvide a URL to a skill definition file.' };
+    const arg = cmd.slice('/skill load '.length).trim();
+    if (!arg) {
+      return { handled: true, responseText: '⚠️ Usage: `/skill load <url | builtin_name | clawhub_slug>`' };
     }
-    // Check if already loaded
-    if (agentGraph._loadedSkills.some(s => s.url === url)) {
-      return { handled: true, responseText: `ℹ️ Skill from ${url} is already loaded.` };
+
+    let url, name, source;
+
+    if (arg.startsWith('http://') || arg.startsWith('https://')) {
+      // Direct URL
+      url = arg;
+      name = arg.split('/').pop().replace(/\.[^.]+$/, '') || 'custom-skill';
+      source = 'url';
+    } else {
+      // Check builtin catalog first
+      const builtin = BUILTIN_SKILLS.find(s => s.name.toLowerCase() === arg.toLowerCase());
+      if (builtin) {
+        url = SKILLS_BASE_URL + builtin.file;
+        name = builtin.name;
+        source = 'builtin';
+      } else {
+        // Try as ClawHub slug
+        url = `https://clawhub.ai/api/v1/skills/${encodeURIComponent(arg)}/content`;
+        name = arg;
+        source = 'clawhub';
+      }
     }
+
+    if (_skillRouter.has(name)) {
+      return { handled: true, responseText: `ℹ️ Skill "${name}" is already loaded.` };
+    }
+
     try {
-      const resp = await fetch(url);
+      const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const content = await resp.text();
-      // Extract name from first line or URL
       const nameMatch = content.match(/^#\s*(.+)/m) || content.match(/name:\s*(.+)/im);
-      const name = nameMatch ? nameMatch[1].trim() : url.split('/').pop().replace(/\.[^.]+$/, '');
-      agentGraph._loadedSkills.push({ name, url, content: content.slice(0, 4000) });
+      if (nameMatch) name = nameMatch[1].trim();
+
+      if (_skillRouter.has(name)) {
+        return { handled: true, responseText: `ℹ️ Skill "${name}" is already loaded.` };
+      }
+
+      const entry = _skillRouter.register({
+        name, source, url, content: content.slice(0, 6000),
+      });
       agentGraph._syncExtensionsToState(graphState);
-      agentGraph._rebuildExecutor();
-      return { handled: true, responseText: `✅ Skill **${name}** loaded from ${url}` };
+      return { handled: true, responseText: `✅ Skill **${name}** loaded from ${source}.\nTriggers: ${entry.triggers.join(', ')}` };
     } catch (e) {
       return { handled: true, responseText: `❌ Failed to load skill: ${e.message}` };
     }
@@ -1401,17 +1839,14 @@ async function handleSlashCommand(text, { agentGraph, graphState, repoStore }) {
   // ── /skill unload <name> ──
   if (lower.startsWith('/skill unload ')) {
     const name = cmd.slice('/skill unload '.length).trim();
-    const idx = agentGraph._loadedSkills.findIndex(s =>
-      s.name.toLowerCase() === name.toLowerCase()
-    );
-    if (idx === -1) {
-      const available = agentGraph._loadedSkills.map(s => s.name).join(', ') || 'none';
+    const skill = _skillRouter.get(name);
+    if (!skill) {
+      const available = _skillRouter.listAll().map(s => s.name).join(', ') || 'none';
       return { handled: true, responseText: `⚠️ Skill "${name}" not found. Loaded: ${available}` };
     }
-    const removed = agentGraph._loadedSkills.splice(idx, 1)[0];
+    _skillRouter.unregister(name);
     agentGraph._syncExtensionsToState(graphState);
-    agentGraph._rebuildExecutor();
-    return { handled: true, responseText: `✅ Skill **${removed.name}** unloaded.` };
+    return { handled: true, responseText: `✅ Skill **${skill.name}** unloaded.` };
   }
 
   // ── /soul list ──
@@ -1432,7 +1867,6 @@ async function handleSlashCommand(text, { agentGraph, graphState, repoStore }) {
     if (!arg) return { handled: true, responseText: '⚠️ Usage: `/soul load <name>` or `/soul load <url>`' };
 
     let url, name;
-    // Check if it's a builtin name
     const builtin = BUILTIN_SOULS.find(s => s.name.toLowerCase() === arg.toLowerCase());
     if (builtin) {
       url = SOULS_BASE_URL + builtin.file;
@@ -1526,7 +1960,7 @@ async function processUserMessage(text, { agentGraph, graphState, history, repoS
  */
 async function runTelegramMode({
   botToken, chatId, agentGraph, graphState, history, repoStore, upstash, loopKey, historyPath,
-  maxRuntime, aiProvider, aiModel,
+  maxRuntime, pollInterval, aiProvider, aiModel,
 }) {
   const { Telegraf } = require('telegraf');
   const bot = new Telegraf(botToken);
@@ -1575,7 +2009,6 @@ async function runTelegramMode({
       `🤖 Loop Agent is running!\n\n` +
       `Key: ${loopKey}\n` +
       `Model: ${aiProvider}/${aiModel}\n\n` +
-      `Send me any message and I'll process it with the AI agent.\n\n` +
       `Commands:\n/start — Show this info\n/status — Agent status\n/stop — Stop the agent`
     );
   });
@@ -1683,7 +2116,113 @@ async function runTelegramMode({
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
+
+
+  // Keep process alive — Telegraf handles the polling loop internally
+  // Also poll for browser intervention messages (Upstash or repo-based)
+  const interventionPollMs = pollInterval || 5000;
+  
+  if (upstash || repoStore) {
+    const inboxKey = `loop:${loopKey}:inbox`;
+    const outboxKey = `loop:${loopKey}:outbox`;
+    const repoInboxPath = `loop-agent/channel/${loopKey}.inbox.json`;
+    const repoOutboxPath = `loop-agent/channel/${loopKey}.outbox.json`;
+
+    console.log(`[Telegram] ✓ Starting browser intervention polling (via ${upstash ? 'Upstash' : 'Repo'})`);
+
+    // Adaptive polling: slow down when idle, speed up on activity
+    let currentInterval = interventionPollMs;
+    const maxInterval = interventionPollMs * 6; // 6x slowdown when idle
+    let emptyPolls = 0;
+    const SLOW_THRESHOLD = 5; // slow down after 5 consecutive empty polls
+
+    const pollOnce = async () => {
+      if (processing) {
+        setTimeout(pollOnce, currentInterval);
+        return;
+      }
+      
+      try {
+        let msg = null;
+        
+        if (upstash) {
+          const raw = await upstash.get(inboxKey);
+          msg = parseMessage(raw);
+          if (msg) {
+            await upstash.set(inboxKey, markAsRead(msg));
+          }
+        } else {
+          const file = await repoStore.readFile(repoInboxPath);
+          if (file) {
+            msg = parseMessage(file.content);
+            if (msg) {
+              try {
+                await repoStore.writeFile(repoInboxPath, markAsRead(msg), '[loop-agent] Mark inbox read');
+              } catch (e) { console.warn(`[Browser Poll] Failed to mark inbox read: ${e.message}`); }
+            }
+          }
+        }
+        
+        if (!msg) {
+          emptyPolls++;
+          if (emptyPolls === SLOW_THRESHOLD) {
+            currentInterval = maxInterval;
+            console.log(`[Browser Poll] No messages for ${SLOW_THRESHOLD} polls, slowing to ${currentInterval / 1000}s`);
+          }
+          setTimeout(pollOnce, currentInterval);
+          return;
+        }
+
+        // Got a message — reset to fast polling
+        if (emptyPolls >= SLOW_THRESHOLD) {
+          console.log(`[Browser Poll] Message received, restoring fast polling (${interventionPollMs / 1000}s)`);
+        }
+        emptyPolls = 0;
+        currentInterval = interventionPollMs;
+
+        if (processing) { setTimeout(pollOnce, currentInterval); return; }
+        processing = true;
+        console.log(`[Browser Poll] Processing browser message (${msg.text.length} chars)`);
+        try {
+          const { responseText } = await processUserMessage(msg.text, {
+            agentGraph, graphState, history, repoStore, loopKey, historyPath,
+          });
+          console.log(`[Browser Poll] Response ready (${responseText.length} chars)`);
+          
+          if (upstash) {
+            await upstash.set(outboxKey, createResponse(responseText));
+          } else {
+            await repoStore.writeFile(repoOutboxPath, createResponse(responseText), '[loop-agent] Write intervention response');
+          }
+          // Also forward to Telegram
+          if (chatId) {
+            try {
+              const chunks = splitTelegramMessage(`📩 [Browser]\n${responseText}`);
+              for (const chunk of chunks) {
+                await bot.telegram.sendMessage(chatId, chunk);
+              }
+            } catch (e) { console.warn(`[Browser Poll] Failed to forward to Telegram: ${e.message}`); }
+          }
+          processedCount++;
+          await updateStatus('running', { lastActive: Date.now() });
+        } catch (processingErr) {
+          console.error(`[Browser Poll] Processing error: ${processingErr.message}`);
+        } finally {
+          processing = false;
+        }
+      } catch (e) {
+        console.error(`[Browser Poll] Poll error: ${e.message}`);
+      }
+      setTimeout(pollOnce, currentInterval);
+    };
+    setTimeout(pollOnce, interventionPollMs);
+  } else {
+    console.log(`[Telegram] ⚠️  Intervention polling DISABLED (no upstash or repoStore available)`);
+  }
+
   // Launch bot polling
+  // [IMPORTANT] must put below code in the end of function
+  // [IMPORTANT] launch won't exit in polling mode
   await bot.launch({
     polling: {
       interval: 300,
@@ -1694,18 +2233,6 @@ async function runTelegramMode({
 
   console.log(`[Telegram] ✅ Bot polling started. Waiting for messages...`);
 
-  // Notify the user that the bot is ready
-  if (chatId) {
-    try {
-      await bot.telegram.sendMessage(chatId,
-        `🤖 Loop Agent started!\n\nKey: ${loopKey}\nModel: ${aiProvider}/${aiModel}\n\nSend me a message to begin.`
-      );
-    } catch (e) {
-      console.warn(`[Telegram] Failed to send startup message: ${e.message}`);
-    }
-  }
-
-  // Keep process alive — Telegraf handles the polling loop internally
   await new Promise(() => {}); // block forever (until shutdown)
 }
 
@@ -1722,7 +2249,18 @@ async function runUpstashMode({
   const outboxKey = `loop:${loopKey}:outbox`;
   const startTime = Date.now();
   let processedCount = 0;
+  let pollCount = 0;
   let dormant = false; // When true, ignore regular messages (only respond to control messages)
+
+  // Adaptive polling: slow down when idle, speed up on activity
+  let currentPollInterval = pollInterval;
+  const maxPollInterval = pollInterval * 6;
+  let emptyPolls = 0;
+  const SLOW_THRESHOLD = 5;
+
+  console.log(`[Upstash Mode] Starting polling loop`);
+  console.log(`[Upstash Mode] Polling keys — inbox: ${inboxKey}, outbox: ${outboxKey}`);
+  console.log(`[Upstash Mode] Poll interval: ${pollInterval / 1000}s (adaptive: slows to ${maxPollInterval / 1000}s when idle)`);
 
   // Write initial status
   try {
@@ -1736,6 +2274,11 @@ async function runUpstashMode({
   } catch (e) {
     console.warn(`[Status] Failed to write initial status: ${e.message}`);
   }
+
+  // ── Main polling loop ──
+  let lastLogTime = startTime;
+  const logIntervalMs = 30000; // Log every 30 seconds
+  let upstashPollCount = 0; // Track polling attempts for debugging
 
   /**
    * Handle control messages (prefixed with __).
@@ -1837,37 +2380,73 @@ async function runUpstashMode({
       break;
     }
 
+    let gotMessage = false;
     try {
       // Poll for new message
-      const raw = await upstash.get(inboxKey);
+      pollCount++;
+      upstashPollCount++;
+      const now = Date.now();
+      const nowIso = new Date().toISOString();
+      const timeSinceLastLog = now - lastLogTime;
+      
+      if (timeSinceLastLog >= logIntervalMs) {
+        // Log every 30s to show the agent is alive and polling
+        const elapsedMin = Math.round((now - startTime) / 60000);
+        console.log(`[Upstash Mode] ✓ Polling active (${elapsedMin}min elapsed, ${pollCount} polls, ${processedCount} msgs processed, dormant=${dormant})`);
+        lastLogTime = now;
+      }
+      
+      let raw;
+      try {
+        console.log(`[Upstash Poll #${upstashPollCount}] [${nowIso}] Calling upstash.get("${inboxKey}")...`);
+        raw = await upstash.get(inboxKey);
+        console.log(`[Upstash Poll #${upstashPollCount}] Raw response: ${raw ? `(type=${typeof raw}, len=${JSON.stringify(raw).length}) ${JSON.stringify(raw).slice(0, 300)}` : 'null/empty'}`);
+      } catch (e) {
+        console.error(`[Upstash Poll #${upstashPollCount}] ❌ Get failed: ${e.message}`);
+        throw e;
+      }
+      
       const msg = parseMessage(raw);
+      console.log(`[Upstash Poll #${upstashPollCount}] Parsed: ${msg ? `unread msg: "${msg.text.slice(0, 80).replace(/\n/g, ' ')}..."` : 'null/empty (no unread message)'}`);
 
       if (msg) {
+        gotMessage = true;
+        console.log(`[Upstash Poll #${upstashPollCount}] ✓ Found unread message, marking as read...`);
         // Mark as read immediately
         await upstash.set(inboxKey, markAsRead(msg));
+        console.log(`[Upstash Poll #${upstashPollCount}] ✓ Marked as read in upstash`);
 
         // Check for control messages first (always handled, even when dormant)
+        console.log(`[Upstash Poll #${upstashPollCount}] Checking if message is control message...`);
         const ctrl = await handleControlMessage(msg.text);
         if (ctrl.handled) {
+          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Processed as control message`);
           // Control message handled — skip normal processing
         } else if (dormant) {
           // Dormant mode — ignore regular messages silently
-          console.log(`[Loop Agent] Dormant — ignoring message (${msg.text.length} chars)`);
+          console.log(`[Upstash Poll #${upstashPollCount}] ⏸ Dormant mode — ignoring message (${msg.text.length} chars)`);
         } else {
-          console.log(`[Loop Agent] Received message (${msg.text.length} chars)`);
+          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Processing regular message (${msg.text.length} chars)`);
+          console.time(`[Upstash Poll #${upstashPollCount}] Message processing`);
 
           const { responseText } = await processUserMessage(msg.text, { agentGraph, graphState, history, repoStore, loopKey, historyPath });
+          console.timeEnd(`[Upstash Poll #${upstashPollCount}] Message processing`);
+          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Response ready (${responseText.length} chars)`);
 
           // Write response to outbox
+          console.log(`[Upstash Poll #${upstashPollCount}] Writing response to outbox key...`);
           await upstash.set(outboxKey, createResponse(responseText));
+          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Response written to upstash outbox`);
 
           // Notify user via Pushoo
           const truncated = responseText.length > 500
             ? responseText.slice(0, 500) + '...'
             : responseText;
+          console.log(`[Upstash Poll #${upstashPollCount}] Sending notification via Pushoo (${pushooPlatform})...`);
           await sendPushoo(pushooPlatform, pushooToken,
             `[Reply] [Loop Agent] Reply`,
             truncated);
+          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Pushoo notification sent`);
 
           processedCount++;
 
@@ -1885,11 +2464,27 @@ async function runUpstashMode({
         }
       }
     } catch (pollErr) {
-      console.warn(`[Poll] Error: ${pollErr.message}`);
+      console.error(`[Upstash Poll #${upstashPollCount}] ❌ Poll error: ${pollErr.message}`);
+      if (pollErr.stack) console.error(`[Upstash Poll #${upstashPollCount}] Stack: ${pollErr.stack.split('\n').slice(0, 3).join('\n')}`);
+    }
+
+    // Adaptive polling: slow down when idle, speed up on activity
+    if (gotMessage) {
+      emptyPolls = 0;
+      if (currentPollInterval !== pollInterval) {
+        currentPollInterval = pollInterval;
+        console.log(`[Upstash Mode] Message received, restoring fast polling (${currentPollInterval / 1000}s)`);
+      }
+    } else {
+      emptyPolls++;
+      if (emptyPolls === SLOW_THRESHOLD && currentPollInterval === pollInterval) {
+        currentPollInterval = maxPollInterval;
+        console.log(`[Upstash Mode] No messages for ${SLOW_THRESHOLD} polls, slowing to ${currentPollInterval / 1000}s`);
+      }
     }
 
     // Wait before next poll
-    await new Promise(r => setTimeout(r, pollInterval));
+    await new Promise(r => setTimeout(r, currentPollInterval));
   }
 
   // Final status update
@@ -1903,6 +2498,104 @@ async function runUpstashMode({
       inputMode: 'upstash',
     }));
   } catch { /* non-critical */ }
+
+  process.exit(0);
+}
+
+/**
+ * Run in Repo mode: poll GitHub repo for messages and reply via Pushoo.
+ * Fallback when neither Telegram nor Upstash is configured.
+ * Browser writes to loop-agent/channel/{loopKey}.inbox.json
+ * Runner writes to loop-agent/channel/{loopKey}.outbox.json
+ */
+async function runRepoMode({
+  agentGraph, graphState, history, repoStore, loopKey, historyPath,
+  pushooPlatform, pushooToken,
+  maxRuntime, pollInterval, aiProvider, aiModel,
+}) {
+  const inboxPath = `loop-agent/channel/${loopKey}.inbox.json`;
+  const outboxPath = `loop-agent/channel/${loopKey}.outbox.json`;
+  const startTime = Date.now();
+  let processedCount = 0;
+
+  // Adaptive polling: slow down when idle, speed up on activity
+  let repoCurrentInterval = pollInterval;
+  const repoMaxInterval = pollInterval * 6;
+  let repoEmptyPolls = 0;
+  const REPO_SLOW_THRESHOLD = 5;
+
+  console.log(`[RepoMode] Starting repo-based polling mode`);
+  console.log(`[RepoMode] Inbox: ${inboxPath}`);
+  console.log(`[RepoMode] Outbox: ${outboxPath}`);
+  console.log(`[RepoMode] Poll interval: ${pollInterval / 1000}s (adaptive: slows to ${repoMaxInterval / 1000}s when idle)`);
+
+  while (true) {
+    const elapsed = Date.now() - startTime;
+    if (elapsed >= maxRuntime) {
+      console.log(`[RepoMode] Max runtime reached (${maxRuntime / 1000}s). Attempting restart...`);
+      const restarted = await selfRestart();
+      const restartMsg = restarted
+        ? `♻️ Loop Agent restarting (max runtime). Processed ${processedCount} messages in ${Math.round(elapsed / 60000)} minutes.`
+        : `⏱ Loop Agent shutting down (max runtime). Processed ${processedCount} messages.`;
+      await sendPushoo(pushooPlatform, pushooToken,
+        `[Loop Agent] ${restarted ? 'Restarting' : 'Shutting Down'}`, restartMsg);
+      break;
+    }
+
+    let repoGotMessage = false;
+    try {
+      const file = await repoStore.readFile(inboxPath);
+      if (file) {
+        const msg = parseMessage(file.content);
+        if (msg) {
+          repoGotMessage = true;
+          console.log(`[RepoMode] Received message (${msg.text.length} chars)`);
+
+          // Mark inbox as read
+          try {
+            await repoStore.writeFile(inboxPath, markAsRead(msg), '[loop-agent] Mark inbox read');
+          } catch (e) {
+            console.warn(`[RepoMode] Failed to mark inbox read: ${e.message}`);
+          }
+
+          const { responseText } = await processUserMessage(msg.text, {
+            agentGraph, graphState, history, repoStore, loopKey, historyPath,
+          });
+
+          // Write response to outbox
+          try {
+            await repoStore.writeFile(outboxPath, createResponse(responseText), '[loop-agent] Write response');
+          } catch (e) {
+            console.warn(`[RepoMode] Failed to write outbox: ${e.message}`);
+          }
+
+          // Notify via pushoo
+          const truncated = responseText.length > 500 ? responseText.slice(0, 500) + '...' : responseText;
+          await sendPushoo(pushooPlatform, pushooToken, `[Reply] [Loop Agent] Reply`, truncated);
+          processedCount++;
+        }
+      }
+    } catch (e) {
+      console.warn(`[RepoMode] Poll error: ${e.message}`);
+    }
+
+    // Adaptive polling: slow down when idle, speed up on activity
+    if (repoGotMessage) {
+      repoEmptyPolls = 0;
+      if (repoCurrentInterval !== pollInterval) {
+        repoCurrentInterval = pollInterval;
+        console.log(`[RepoMode] Message received, restoring fast polling (${repoCurrentInterval / 1000}s)`);
+      }
+    } else {
+      repoEmptyPolls++;
+      if (repoEmptyPolls === REPO_SLOW_THRESHOLD && repoCurrentInterval === pollInterval) {
+        repoCurrentInterval = repoMaxInterval;
+        console.log(`[RepoMode] No messages for ${REPO_SLOW_THRESHOLD} polls, slowing to ${repoCurrentInterval / 1000}s`);
+      }
+    }
+
+    await new Promise(r => setTimeout(r, repoCurrentInterval));
+  }
 
   process.exit(0);
 }
@@ -1925,14 +2618,13 @@ async function main() {
   const SYSTEM_PROMPT = process.env.LOOP_SYSTEM_PROMPT || '';
 
   const useTelegram = isTelegramPlatform(PUSHOO_PLATFORM) && PUSHOO_TOKEN_VAL;
+  const hasUpstash = !!(UPSTASH_URL && UPSTASH_TOKEN);
+  const hasRepoStore = !!(GH_PAT && GITHUB_REPOSITORY);
 
   // Validate required env
-  if (!useTelegram) {
-    // Upstash mode requires Upstash credentials
-    if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-      console.error('[FATAL] UPSTASH_URL and UPSTASH_TOKEN are required (non-Telegram mode)');
-      process.exit(1);
-    }
+  if (!useTelegram && !hasUpstash && !hasRepoStore) {
+    console.error('[FATAL] Either Telegram, Upstash, or GitHub repo access (GH_PAT) is required for messaging');
+    process.exit(1);
   }
   if (!LOOP_KEY) {
     console.error('[FATAL] LOOP_KEY is required');
@@ -1943,16 +2635,60 @@ async function main() {
     process.exit(1);
   }
 
+  const inputMode = useTelegram ? 'Telegram' : hasUpstash ? 'Upstash' : 'Repo';
   console.log(`[Loop Agent] Starting...`);
   console.log(`  Key: ${LOOP_KEY}`);
   console.log(`  Provider: ${AI_PROVIDER}, Model: ${AI_MODEL}`);
-  console.log(`  Input mode: ${useTelegram ? 'Telegram (Telegraf polling)' : 'Upstash polling'}`);
+  console.log(`  Input mode: ${inputMode}`);
   console.log(`  Max runtime: ${MAX_RUNTIME / 1000}s`);
 
   // Upstash client (optional in Telegram mode)
   const upstash = (UPSTASH_URL && UPSTASH_TOKEN)
     ? new UpstashClient(UPSTASH_URL, UPSTASH_TOKEN)
     : null;
+
+  console.log(`[Main] Upstash client initialization:`);
+  console.log(`  - UPSTASH_URL: ${UPSTASH_URL ? 'present' : '❌ missing'}`);
+  console.log(`  - UPSTASH_TOKEN: ${UPSTASH_TOKEN ? 'present' : '❌ missing'}`);
+  console.log(`  - upstash object: ${upstash ? '✓ created' : '❌ null (missing env variables)'}`);
+
+  // ── Upstash connectivity test ──
+  if (upstash) {
+    const inboxKey = `loop:${LOOP_KEY}:inbox`;
+    const outboxKey = `loop:${LOOP_KEY}:outbox`;
+    const statusKey = `loop:${LOOP_KEY}:status`;
+    console.log(`[Upstash] URL: ${UPSTASH_URL.slice(0, 30)}...`);
+    console.log(`[Upstash] Inbox key:  ${inboxKey}`);
+    console.log(`[Upstash] Outbox key: ${outboxKey}`);
+    console.log(`[Upstash] Status key: ${statusKey}`);
+    try {
+      console.log(`[Upstash] Testing connection with PING...`);
+      await upstash.ping();
+      console.log(`[Upstash] ✅ Connection verified (PING → PONG)`);
+      // Check if there are any pending messages in the inbox
+      console.log(`[Upstash] Checking for pending messages in inbox...`);
+      const pending = await upstash.get(inboxKey);
+      console.log(`[Upstash] Inbox value: ${pending ? `(${typeof pending}) ${JSON.stringify(pending).slice(0, 200)}` : 'empty'}`);
+      if (pending) {
+        const msg = parseMessage(pending);
+        console.log(`[Upstash] Inbox has ${msg ? 'an UNREAD' : 'a read/empty'} message waiting`);
+      } else {
+        console.log(`[Upstash] Inbox is empty — waiting for browser messages`);
+      }
+    } catch (e) {
+      console.error(`[Upstash] ❌ Connection FAILED: ${e.message}`);
+      console.error(`[Upstash] Error details: ${e.stack ? e.stack.split('\n')[1] : 'no stack'}`);
+      console.error(`[Upstash] Check UPSTASH_URL and UPSTASH_TOKEN in repo secrets`);
+      console.error(`[Upstash] UPSTASH_URL length: ${UPSTASH_URL ? UPSTASH_URL.length : 'undefined'}`);
+      console.error(`[Upstash] UPSTASH_TOKEN length: ${UPSTASH_TOKEN ? UPSTASH_TOKEN.length : 'undefined'}`);
+      if (!useTelegram && hasUpstash && !hasRepoStore) {
+        console.error(`[FATAL] Upstash is the only messaging channel but connection failed`);
+        process.exit(1);
+      }
+    }
+  } else {
+    console.log(`[Upstash] Not configured — ${hasRepoStore ? 'using repo-based polling' : 'N/A'}`);
+  }
 
   const LOOP_ENCRYPT_KEY = process.env.LOOP_ENCRYPT_KEY || '';
 
@@ -2012,7 +2748,7 @@ async function main() {
     `🤖 Loop Agent Started`,
     `Key: ${LOOP_KEY}`,
     `Model: ${AI_PROVIDER}/${AI_MODEL}`,
-    `Mode: ${useTelegram ? 'Telegram' : 'Upstash'}`,
+    `Mode: ${inputMode}`,
     `Max Runtime: ${MAX_RUNTIME / 1000}s`,
     SYSTEM_PROMPT ? `System Prompt: ${SYSTEM_PROMPT.slice(0, 200)}${SYSTEM_PROMPT.length > 200 ? '...' : ''}` : '',
   ].filter(Boolean).join('\n');
@@ -2046,15 +2782,28 @@ async function main() {
     await runTelegramMode({
       botToken, chatId, agentGraph, graphState, history, repoStore, upstash, loopKey: LOOP_KEY,
       historyPath: LOOP_HISTORY_PATH,
-      maxRuntime: MAX_RUNTIME, aiProvider: AI_PROVIDER, aiModel: AI_MODEL,
+      maxRuntime: MAX_RUNTIME, pollInterval: POLL_INTERVAL,
+      aiProvider: AI_PROVIDER, aiModel: AI_MODEL,
     });
-  } else {
-    // ── Upstash mode (original) ──
+  } else if (hasUpstash) {
+    // ── Upstash mode ──
     console.log(`  Poll interval: ${POLL_INTERVAL / 1000}s`);
     console.log(`  Pushoo: ${PUSHOO_PLATFORM || 'disabled'}`);
 
     await runUpstashMode({
       upstash, agentGraph, graphState, history, repoStore, loopKey: LOOP_KEY,
+      historyPath: LOOP_HISTORY_PATH,
+      pushooPlatform: PUSHOO_PLATFORM, pushooToken: PUSHOO_TOKEN_VAL,
+      maxRuntime: MAX_RUNTIME, pollInterval: POLL_INTERVAL,
+      aiProvider: AI_PROVIDER, aiModel: AI_MODEL,
+    });
+  } else {
+    // ── Repo mode (fallback — no Telegram, no Upstash) ──
+    console.log(`  Poll interval: ${POLL_INTERVAL / 1000}s`);
+    console.log(`  Pushoo: ${PUSHOO_PLATFORM || 'disabled'}`);
+
+    await runRepoMode({
+      agentGraph, graphState, history, repoStore, loopKey: LOOP_KEY,
       historyPath: LOOP_HISTORY_PATH,
       pushooPlatform: PUSHOO_PLATFORM, pushooToken: PUSHOO_TOKEN_VAL,
       maxRuntime: MAX_RUNTIME, pollInterval: POLL_INTERVAL,

@@ -51,11 +51,11 @@
       <button class="quick-action-btn" id="quick-btn-compact" data-cmd="/compact" title="Compress context">📦 Compact</button>
       <button class="quick-action-btn" id="quick-btn-loop" data-cmd="/loop" title="Loop Agent">🔄 Loop</button>
     </div>
+    <div id="loop-connect-banner" class="hidden" style="display:none;align-items:center;justify-content:space-between;padding:6px 14px;background:linear-gradient(90deg,#1a3a2a,#0d1f17);border:1px solid #22863a;border-radius:8px;font-size:13px;color:#4ae168;margin:0 24px 4px;">
+      <span>🔄 Connected to Loop Agent: <strong id="loop-connect-key"></strong></span>
+      <button id="loop-disconnect-btn" style="background:none;border:1px solid #4ae168;color:#4ae168;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:12px;" title="Disconnect from loop agent">✕ Disconnect</button>
+    </div>
     <div class="input-area">
-      <div id="loop-context-banner" class="loop-context-banner hidden">
-        <span id="loop-context-label">🔄 Loop mode: <strong id="loop-context-key"></strong></span>
-        <button id="loop-context-exit" title="Exit loop mode">✕</button>
-      </div>
       <div id="slash-autocomplete" class="hidden"></div>
       <textarea
         id="message-input"
@@ -331,28 +331,29 @@
 
     </div>
 
-    <!-- Loop Agent (Upstash) -->
+    <!-- Loop Agent -->
     <div class="settings-group" id="settings-section-loop">
       <div class="settings-group-title">🔄 Loop Agent</div>
+      <div class="hint" style="margin:4px 0 8px;">Loop Agent requires a messaging channel (e.g. Telegram) configured in Notifications below. Upstash is optional for real-time browser intervention.</div>
 
-      <div class="settings-field">
-        <label for="set-upstash-url">Upstash Redis REST URL</label>
-        <input type="url" id="set-upstash-url" placeholder="https://your-redis.upstash.io" />
-        <div class="hint">REST API URL from <a href="https://console.upstash.com" target="_blank">Upstash Console</a></div>
-      </div>
-
-      <div class="settings-field">
-        <label for="set-upstash-token">Upstash Redis REST Token</label>
-        <div class="password-input-group">
-          <input type="password" id="set-upstash-token" placeholder="AXxx..." autocomplete="off" />
-          <button type="button" class="password-toggle" data-for="set-upstash-token" title="Show/hide">👁</button>
+      <div class="collapsible-section">
+        <button class="collapsible-header" type="button">
+          <span class="collapsible-toggle">▶</span>
+          <span>Upstash Redis (Optional — for browser intervention)</span>
+        </button>
+        <div class="collapsible-body">
+          <div class="settings-field">
+            <label for="set-upstash-url">Upstash Redis REST URL</label>
+            <input id="set-upstash-url" type="text" placeholder="https://xxxx.upstash.io" autocomplete="off" />
+            <div class="hint">Optional. Enables real-time browser ↔ agent communication via <code>/loop send</code>. Without this, repo-based polling is used as fallback.</div>
+          </div>
+          <div class="settings-field">
+            <label for="set-upstash-token">Upstash REST Token</label>
+            <div class="password-input-group">
+              <input id="set-upstash-token" type="password" autocomplete="off" />
+            </div>
+          </div>
         </div>
-        <div class="hint">REST token from Upstash Console. Used for message passing with the loop agent</div>
-      </div>
-
-      <div class="settings-field">
-        <button id="test-upstash-btn" class="btn-secondary" type="button">🔗 Test Upstash Connection</button>
-        <span id="upstash-test-result" style="font-size:12px;margin-left:8px;"></span>
       </div>
     </div>
 

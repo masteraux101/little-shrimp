@@ -1,4 +1,4 @@
-# 🍤 小虾米
+# 🍤 LittleShrimp
 
 Languages: [English](README.md) | [简体中文](README.zh-CN.md)
 

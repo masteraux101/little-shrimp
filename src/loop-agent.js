@@ -108,7 +108,7 @@ const LoopAgent = (() => {
    * @param {string} opts.runnerScript - The runner.js content
    * @param {string} opts.loopKey - Unique loop key
    * @param {Object} opts.agentOpts - { provider, model, pollInterval, maxRuntime, systemPrompt }
-   * @param {Object} opts.secrets - { aiApiKey, upstashUrl, upstashToken, pushooPlatform, pushooToken }
+   * @param {Object} opts.secrets - { aiApiKey, pushooPlatform, pushooToken }
    * @param {function} opts.onProgress - (step, detail) progress callback
    * @returns {Object} { loopKey, workflowFile, repoUrl }
    */
@@ -154,8 +154,6 @@ const LoopAgent = (() => {
 
     // 3. Sync secrets
     progress('secrets', t(lang, 'loopStepSecrets'));
-    const hasPushoo = !!(secrets.pushooPlatform && secrets.pushooToken);
-    console.log(`[LoopAgent] Preparing secrets. pushoo enabled: ${hasPushoo ? 'yes' : 'no'}, platform=${secrets.pushooPlatform || '(none)'}, token=${secrets.pushooToken ? 'present(' + secrets.pushooToken.length + ' chars)' : '(none)'}`);
     const secretMap = [];
     if (secrets.upstashUrl)     secretMap.push({ name: 'UPSTASH_URL',     value: secrets.upstashUrl });
     if (secrets.upstashToken)   secretMap.push({ name: 'UPSTASH_TOKEN',   value: secrets.upstashToken });
@@ -206,144 +204,6 @@ const LoopAgent = (() => {
       synced,
       errors,
     };
-  }
-
-  /**
-   * Validate Upstash configuration.
-   */
-  function validateUpstashConfig(url, token) {
-    if (!url || typeof url !== 'string') return { valid: false, error: 'Upstash URL is required' };
-    if (!token || typeof token !== 'string') return { valid: false, error: 'Upstash token is required' };
-    if (!url.startsWith('https://')) return { valid: false, error: 'Upstash URL must start with https://' };
-    return { valid: true };
-  }
-
-  /**
-   * Test Upstash connectivity by performing a PING.
-   */
-  async function testUpstash(url, token) {
-    try {
-      const resp = await fetch(url.replace(/\/+$/, ''), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(['PING']),
-      });
-      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
-      const data = await resp.json();
-      return { ok: data.result === 'PONG', error: data.result !== 'PONG' ? 'Unexpected response' : null };
-    } catch (e) {
-      return { ok: false, error: e.message };
-    }
-  }
-
-  /**
-   * Send a message to a running loop agent via Upstash.
-   */
-  async function sendMessage(upstashUrl, upstashToken, loopKey, text) {
-    const msg = JSON.stringify({
-      ts: Date.now(),
-      from: 'user',
-      text,
-      extra: {},
-      read: false,
-    });
-
-    // Clear outbox before sending so stale responses don't interfere
-    const outboxKey = `loop:${loopKey}:outbox`;
-    try {
-      await fetch(upstashUrl.replace(/\/+$/, ''), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${upstashToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(['DEL', outboxKey]),
-      });
-    } catch { /* best effort */ }
-
-    const inboxKey = `loop:${loopKey}:inbox`;
-    const resp = await fetch(upstashUrl.replace(/\/+$/, ''), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${upstashToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(['SET', inboxKey, msg]),
-    });
-    if (!resp.ok) throw new Error(`Failed to send message: ${resp.status}`);
-    return resp.json();
-  }
-
-  /**
-   * Read the latest response from the loop agent's outbox.
-   */
-  async function readResponse(upstashUrl, upstashToken, loopKey) {
-    const outboxKey = `loop:${loopKey}:outbox`;
-    const resp = await fetch(upstashUrl.replace(/\/+$/, ''), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${upstashToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(['GET', outboxKey]),
-    });
-    if (!resp.ok) throw new Error(`Failed to read response: ${resp.status}`);
-    const data = await resp.json();
-    if (!data.result) return null;
-    try {
-      return JSON.parse(data.result);
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Get the status of a running loop agent.
-   */
-  async function getStatus(upstashUrl, upstashToken, loopKey) {
-    const statusKey = `loop:${loopKey}:status`;
-    const resp = await fetch(upstashUrl.replace(/\/+$/, ''), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${upstashToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(['GET', statusKey]),
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    if (!data.result) return null;
-    try {
-      return JSON.parse(data.result);
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Clear the status and inbox/outbox of a loop agent.
-   * Useful when deleting a workflow to clean up Upstash state.
-   */
-  async function clearStatus(upstashUrl, upstashToken, loopKey) {
-    const keys = [
-      `loop:${loopKey}:status`,
-      `loop:${loopKey}:inbox`,
-      `loop:${loopKey}:outbox`,
-    ];
-    const resp = await fetch(upstashUrl.replace(/\/+$/, ''), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${upstashToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(['DEL', ...keys]),
-    });
-    if (!resp.ok) throw new Error(`Upstash error: ${resp.status}`);
-    const data = await resp.json();
-    return { deletedKeys: data.result || 0 };
   }
 
   /**
@@ -431,28 +291,173 @@ const LoopAgent = (() => {
     return { cleared: true };
   }
 
+  // ─── Browser-side Intervention Channel ─────────────────────────────
+
   /**
-   * Poll the outbox for a new response.
-   * Returns the parsed response and deletes it from outbox to prevent re-reading.
-   * The sinceTs parameter is kept for backward compatibility but the primary
-   * mechanism is now presence-based: if an outbox value exists, it is new.
+   * Send an intervention message to a running loop agent.
+   * Routes to Upstash (if configured) or repo-based channel (fallback).
+   *
+   * @param {Object} actionConfig - { token, owner, repo }
+   * @param {string} loopKey - The loop agent key
+   * @param {string} text - Message text to send
+   * @param {Object} opts - { upstashUrl, upstashToken, encryptKey }
+   * @returns {{ channel: 'upstash' | 'repo' }}
    */
-  async function pollResponse(upstashUrl, upstashToken, loopKey, sinceTs = 0) {
-    const resp = await readResponse(upstashUrl, upstashToken, loopKey);
-    if (!resp) return null;
-    // Response exists — consume it by deleting the outbox key
-    const outboxKey = `loop:${loopKey}:outbox`;
-    try {
-      await fetch(upstashUrl.replace(/\/+$/, ''), {
+  async function sendIntervention(actionConfig, loopKey, text, opts = {}) {
+    const { upstashUrl, upstashToken, encryptKey } = opts;
+    const message = JSON.stringify({
+      ts: Date.now(),
+      from: 'user',
+      text,
+      read: false,
+      extra: {},
+    });
+
+    if (upstashUrl && upstashToken) {
+      // Upstash mode
+      const inboxKey = `loop:${loopKey}:inbox`;
+      const resp = await fetch(upstashUrl.replace(/\/+$/, ''), {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${upstashToken}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(['DEL', outboxKey]),
+        body: JSON.stringify(['SET', inboxKey, message]),
       });
-    } catch { /* best effort */ }
-    return resp;
+      if (!resp.ok) throw new Error(`Upstash write failed: ${resp.status}`);
+      return { channel: 'upstash' };
+    }
+
+    // Repo-based fallback
+    const { token, owner, repo } = actionConfig;
+    const inboxPath = `loop-agent/channel/${loopKey}.inbox.json`;
+    let content = message;
+    if (encryptKey) {
+      content = 'ENCRYPTED:' + await Crypto.encrypt(encryptKey, content);
+    }
+
+    // Get existing file SHA if it exists (for update)
+    const getResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/contents/${inboxPath}?ref=main`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.v3+json' } }
+    );
+    const body = {
+      message: '[loop-agent] Browser intervention message',
+      content: btoa(unescape(encodeURIComponent(content))),
+      branch: 'main',
+    };
+    if (getResp.ok) {
+      const data = await getResp.json();
+      body.sha = data.sha;
+    }
+
+    const putResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/contents/${inboxPath}`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github.v3+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      }
+    );
+    if (!putResp.ok) throw new Error(`Failed to write intervention message: ${putResp.status}`);
+    return { channel: 'repo' };
+  }
+
+  /**
+   * Poll for intervention response from a running loop agent.
+   * Returns the response message object { ts, from, text } or null if no response.
+   *
+   * @param {Object} actionConfig - { token, owner, repo }
+   * @param {string} loopKey - The loop agent key
+   * @param {Object} opts - { upstashUrl, upstashToken, encryptKey }
+   * @returns {Object|null}
+   */
+  async function pollIntervention(actionConfig, loopKey, opts = {}) {
+    const { upstashUrl, upstashToken, encryptKey } = opts;
+
+    if (upstashUrl && upstashToken) {
+      // Upstash mode — read outbox
+      const outboxKey = `loop:${loopKey}:outbox`;
+      const resp = await fetch(upstashUrl.replace(/\/+$/, ''), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${upstashToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(['GET', outboxKey]),
+      });
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      if (!data.result) return null;
+      try {
+        const msg = typeof data.result === 'string' ? JSON.parse(data.result) : data.result;
+        if (!msg.text || msg.read) return null;
+        // Mark as read
+        await fetch(upstashUrl.replace(/\/+$/, ''), {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${upstashToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(['SET', outboxKey, JSON.stringify({ ...msg, read: true })]),
+        });
+        return msg;
+      } catch { return null; }
+    }
+
+    // Repo-based fallback — read outbox file
+    const { token, owner, repo } = actionConfig;
+    const outboxPath = `loop-agent/channel/${loopKey}.outbox.json`;
+    const resp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/contents/${outboxPath}?ref=main`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.v3+json' } }
+    );
+    if (resp.status === 404 || !resp.ok) return null;
+
+    const fileData = await resp.json();
+    const binary = atob(fileData.content.replace(/\n/g, ''));
+    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+    let content = new TextDecoder('utf-8').decode(bytes);
+
+    // Decrypt if needed
+    if (content.startsWith('ENCRYPTED:') && encryptKey) {
+      try { content = await Crypto.decrypt(encryptKey, content.slice('ENCRYPTED:'.length)); }
+      catch { return null; }
+    }
+
+    try {
+      const msg = JSON.parse(content);
+      if (!msg.text || msg.read) return null;
+
+      // Mark as read by writing back
+      const updated = JSON.stringify({ ...msg, read: true });
+      let writeContent = updated;
+      if (encryptKey) {
+        writeContent = 'ENCRYPTED:' + await Crypto.encrypt(encryptKey, updated);
+      }
+      await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/contents/${outboxPath}`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message: '[loop-agent] Mark outbox read',
+            content: btoa(unescape(encodeURIComponent(writeContent))),
+            sha: fileData.sha,
+            branch: 'main',
+          }),
+        }
+      );
+      return msg;
+    } catch { return null; }
   }
 
   return {
@@ -460,15 +465,10 @@ const LoopAgent = (() => {
     generateLoopKey,
     generateWorkflowYaml,
     deploy,
-    validateUpstashConfig,
-    testUpstash,
-    sendMessage,
-    readResponse,
-    getStatus,
-    clearStatus,
     fetchHistory,
     clearMemory,
-    pollResponse,
+    sendIntervention,
+    pollIntervention,
   };
 })();
 

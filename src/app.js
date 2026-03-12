@@ -29,11 +29,25 @@ const App = (() => {
   let soulOnlyInstruction = ''; // SOUL-only text, used for dynamic skill recomposition
   let currentLang = 'en';
 
-  // ─── Loop Mode State ───────────────────────────────────────────────
-  let _loopModeKey = null;        // Active loop key when in loop mode (null = not in loop mode)
-  let _loopPollTimer = null;      // Polling timer for loop responses
-  let _loopLastResponseTs = 0;    // Timestamp of last received response
-  let _loopEncryptKey = null;     // Encryption key for the active loop session (in-memory only)
+  // ─── Loop State ─────────────────────────────────────────────────────
+  let _loopEncryptKey = null;     // Encryption key for loop sync operations (in-memory only)
+  let _loopConnectedKey = null;   // Currently connected loop agent key (null = not connected)
+  let _loopPollTimer = null;      // Timeout for polling loop agent responses
+  let _loopPollReset = null;      // Function to reset adaptive polling to fast mode
+
+  function disconnectLoopAgent() {
+    if (_loopPollTimer) {
+      clearTimeout(_loopPollTimer);
+      _loopPollTimer = null;
+    }
+    _loopConnectedKey = null;
+    _loopPollReset = null;
+    const banner = document.getElementById('loop-connect-banner');
+    if (banner) {
+      banner.classList.add('hidden');
+      banner.style.display = 'none';
+    }
+  }
 
   // ─── Built-in Catalog ──────────────────────────────────────────────
   // Cached catalog entries loaded from bundled examples/ directory.
@@ -476,13 +490,6 @@ const App = (() => {
 
     // Loop Agent section
     setText('#settings-section-loop .settings-group-title', `🔄 ${tl('loopAgentTitle')}`);
-    setText('label[for="set-upstash-url"]', tl('upstashUrlLabel'));
-    const upstashUrlHint = $('#set-upstash-url')?.parentElement?.querySelector('.hint');
-    if (upstashUrlHint) upstashUrlHint.childNodes[0].textContent = `${tl('upstashUrlHint')} `;
-    setText('label[for="set-upstash-token"]', tl('upstashTokenLabel'));
-    const upstashTokenHintEl = $('#set-upstash-token')?.closest('.settings-field')?.querySelector('.hint');
-    if (upstashTokenHintEl) upstashTokenHintEl.textContent = tl('upstashTokenHint');
-    setText('#test-upstash-btn', `🔗 ${tl('testUpstash')}`);
 
     setText('#settings-section-notify .settings-group-title', `🔔 ${tl('notifyTitle')}`);
     const pushooLabel = $('#pushoo-config-btn')?.closest('.settings-field')?.querySelector('label');
@@ -493,7 +500,7 @@ const App = (() => {
     setText('#pushoo-config-btn', `⚙️ ${tl('configPushoo')}`);
     const pushooHint = $('#pushoo-config-btn')?.parentElement?.querySelector('.hint');
     if (pushooHint) pushooHint.childNodes[0].textContent = `${tl('pushooHint')} — `;
-    const collapsibleEmail = document.querySelector('.collapsible-header span:last-child');
+    const collapsibleEmail = document.querySelector('#settings-section-notify .collapsible-header span:last-child');
     if (collapsibleEmail) collapsibleEmail.textContent = tl('emailNotifyResend');
     setText('label[for="set-resend-api-key"]', tl('resendApiKey'));
     const resendHint = $('#set-resend-api-key')?.parentElement?.parentElement?.querySelector('.hint');
@@ -1179,15 +1186,9 @@ const App = (() => {
       { cmd: '/github delete',  desc: tl('slashGithubDeleteDesc') },
       { cmd: '/loop',           desc: tl('slashLoopDesc') },
       { cmd: '/loop status',    desc: tl('slashLoopStatusDesc') },
-      { cmd: '/loop send',      desc: tl('slashLoopSendDesc') },
-      { cmd: '/loop join',      desc: 'Join a running loop agent conversation interactively' },
-      { cmd: '/loop leave',     desc: 'Leave current loop agent conversation' },
-      { cmd: '/loop roll',      desc: 'Ask all running loop agents to identify themselves' },
-      { cmd: '/loop focus',     desc: 'Focus on one agent — others go dormant' },
-      { cmd: '/loop wake',      desc: 'Wake all dormant loop agents' },
+      { cmd: '/loop connect',   desc: tl('slashLoopConnectDesc') },
+      { cmd: '/loop disconnect', desc: tl('slashLoopDisconnectDesc') },
       { cmd: '/loop memory clear', desc: 'Clear the loop agent persistent memory file' },
-      { cmd: '/loop clear',     desc: 'Clear Upstash state for a deleted loop agent' },
-      { cmd: '/loop sync',      desc: 'Sync loop agent conversation history from GitHub repo' },
       { cmd: '/skills',         desc: tl('slashSkillsDesc') },
       { cmd: '/soul',           desc: tl('slashSoulDesc') },
       { cmd: '/soul list',      desc: tl('slashSoulListDesc') },
@@ -2041,19 +2042,9 @@ const App = (() => {
       try { config = getActionConfig(); }
       catch (e) { addMessageBubble('model', `⚠️ ${e.message}`); return true; }
 
-      // Helper: try to extract loop key from workflow filename and clean Upstash
+      // Helper: extract loop key from workflow filename for cleanup tracking
       const tryCleanUpstash = async (wfPath) => {
-        try {
-          const upstashUrl = getSessionSetting('upstashUrl');
-          const upstashToken = getSessionSetting('upstashToken');
-          if (!upstashUrl || !upstashToken) return '';
-          // Extract loop key from workflow name pattern: loop-agent-*.yml or name containing loop-XXXXXXXX
-          const match = wfPath.match(/loop-([0-9a-f]{8})/i);
-          if (!match) return '';
-          const loopKey = `loop-${match[1]}`;
-          const result = await LoopAgent.clearStatus(upstashUrl, upstashToken, loopKey);
-          return `\n🧹 Upstash keys cleaned for **${loopKey}** (${result.deletedKeys} keys)`;
-        } catch { return ''; }
+        return ''; // Upstash cleanup no longer needed — communication now via messaging channels
       };
 
       const argPart = text.trim().slice('/github delete'.length).trim();
@@ -2128,33 +2119,33 @@ const App = (() => {
 
     if (cmd === '/loop status') {
       addMessageBubble('user', '/loop status');
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        addMessageBubble('model', `⚠️ ${tl('msgUpstashNotConfigured')}`);
+
+      const cfg = getSessionConfig(currentSessionId);
+      const loopKeys = cfg.loopKeys || [];
+      if (loopKeys.length === 0) {
+        addMessageBubble('model', `_${tl('msgNoLoopAgents')}_`);
         return true;
       }
+
+      let config;
+      try { config = getActionConfig(); }
+      catch (e) { addMessageBubble('model', `⚠️ ${e.message}`); return true; }
 
       const bubble = addMessageBubble('model', `⏳ ${tl('msgCheckingLoopStatus')}…`);
       (async () => {
         try {
-          // Check all known loop keys from session config
-          const cfg = getSessionConfig(currentSessionId);
-          const loopKeys = cfg.loopKeys || [];
-          if (loopKeys.length === 0) {
-            bubble.innerHTML = renderMarkdown(`_${tl('msgNoLoopAgents')}_`);
-            return;
-          }
-
+          // Check loop agent workflow runs via GitHub Actions API
+          const recentRuns = await GitHubActions.listRecentRuns(config, null, 30);
           const lines = [`## 🔄 ${tl('msgLoopAgentStatus')}\n`];
           for (const key of loopKeys) {
-            const status = await LoopAgent.getStatus(upstashUrl, upstashToken, key);
-            if (status) {
-              const stateIcon = status.state === 'running' ? '🟢' : '🔴';
-              const elapsed = status.startedAt ? Math.round((Date.now() - status.startedAt) / 60000) : '?';
-              lines.push(`- ${stateIcon} **${key}** — ${status.state} · ${status.model || 'unknown'} · ${elapsed}min · ${status.processedCount || 0} msgs`);
+            // Find the most recent run matching this loop key
+            const run = recentRuns.find(r => r.name && r.name.includes(key));
+            if (run) {
+              const stateIcon = run.status === 'in_progress' || run.status === 'queued' ? '🟢' : run.conclusion === 'success' ? '✅' : '🔴';
+              const elapsed = Math.round((Date.now() - new Date(run.run_started_at || run.created_at).getTime()) / 60000);
+              lines.push(`- ${stateIcon} **${key}** — ${run.status}${run.conclusion ? ` (${run.conclusion})` : ''} · ${elapsed}min · [View](${run.html_url})`);
             } else {
-              lines.push(`- ⚪ **${key}** — no status data`);
+              lines.push(`- ⚪ **${key}** — no workflow run found`);
             }
           }
           bubble.innerHTML = renderMarkdown(lines.join('\n'));
@@ -2190,276 +2181,11 @@ const App = (() => {
       return true;
     }
 
-    // ─── /loop leave — Exit loop conversation mode ─────────────────────
-    if (cmd === '/loop leave') {
-      addMessageBubble('user', '/loop leave');
-      if (!_loopModeKey) {
-        addMessageBubble('model', `ℹ️ Not currently in loop mode.`);
-      } else {
-        exitLoopMode();
-        addMessageBubble('model', `✅ Left loop conversation mode.`);
-      }
-      return true;
-    }
+    // /loop leave, join, send, roll, focus, wake — multi-agent coordination handled by runner.js
 
-    // ─── /loop join <key> — Join loop agent conversation ───────────────
-    if (cmd.startsWith('/loop join')) {
-      const loopKeyArg = text.trim().slice('/loop join'.length).trim();
-      addMessageBubble('user', text.trim());
-
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        addMessageBubble('model', `⚠️ ${tl('msgUpstashNotConfigured')}`);
-        return true;
-      }
-
-      if (!loopKeyArg) {
-        // Show available loops
-        const cfg = getSessionConfig(currentSessionId);
-        const keys = cfg.loopKeys || [];
-        if (keys.length === 0) {
-          addMessageBubble('model', `⚠️ No loop agents found in this session.\n\nUsage: \`/loop join <key>\``);
-        } else {
-          // Check which ones are running
-          const lines = [`**Available loops:**\n`];
-          for (const key of keys) {
-            const status = await LoopAgent.getStatus(upstashUrl, upstashToken, key);
-            const icon = status?.state === 'running' ? '🟢' : '⚪';
-            lines.push(`- ${icon} \`${key}\`${status?.state === 'running' ? ' (running)' : ''}`);
-          }
-          lines.push(`\nUsage: \`/loop join <key>\``);
-          addMessageBubble('model', renderMarkdown(lines.join('\n')), true);
-        }
-        return true;
-      }
-
-      // Check if the loop agent is running
-      const status = await LoopAgent.getStatus(upstashUrl, upstashToken, loopKeyArg);
-      if (!status || status.state !== 'running') {
-        addMessageBubble('model', `⚠️ Loop agent **${escapeHtml(loopKeyArg)}** is not running.\n\nUse \`/loop status\` to check available agents.`);
-        return true;
-      }
-
-      // Load history and enter loop mode
-      // Check if this loop is known to be encrypted
-      const sessionCfg = getSessionConfig(currentSessionId);
-      const isEncrypted = sessionCfg.loopEncrypted?.[loopKeyArg];
-
-      const bubble = addMessageBubble('model', '');
-
-      function showJoinKeyPrompt() {
-        bubble.innerHTML = `
-          <div class="schedule-wizard" style="max-width:400px;">
-            <div class="schedule-wizard-title">🔐 Encrypted Loop — ${escapeHtml(loopKeyArg)}</div>
-            <label class="schedule-field-label">Enter decryption key</label>
-            <input id="loop-join-key-input" class="schedule-input" type="password" placeholder="Encryption passphrase…" autocomplete="off" />
-            <div class="hint" style="margin-top:2px;">This is the key you set when deploying the loop agent.</div>
-            <div class="schedule-actions" style="margin-top:10px;">
-              <button id="loop-join-cancel" class="schedule-btn schedule-btn-secondary">Cancel</button>
-              <button id="loop-join-submit" class="schedule-btn schedule-btn-primary">🔓 Decrypt & Join</button>
-            </div>
-          </div>
-        `;
-        bubble.querySelector('#loop-join-cancel').addEventListener('click', () => {
-          bubble.innerHTML = renderMarkdown(`_Join cancelled._`);
-        });
-        bubble.querySelector('#loop-join-submit').addEventListener('click', async () => {
-          const inputKey = bubble.querySelector('#loop-join-key-input').value.trim();
-          if (!inputKey) { showToast('Please enter the decryption key', 'error'); return; }
-          bubble.innerHTML = renderMarkdown(`⏳ Loading conversation history for **${escapeHtml(loopKeyArg)}**…`);
-          await loadAndJoinLoop(loopKeyArg, bubble, inputKey);
-        });
-      }
-
-      // If encrypted, show a key prompt card; otherwise load directly
-      if (isEncrypted) {
-        showJoinKeyPrompt();
-      } else {
-        bubble.innerHTML = renderMarkdown(`⏳ Loading conversation history for **${escapeHtml(loopKeyArg)}**…`);
-        await loadAndJoinLoop(loopKeyArg, bubble, null);
-      }
-      return true;
-    }
-
-    if (cmd.startsWith('/loop send ')) {
-      const parts = text.trim().slice('/loop send '.length).split(' ');
-      const loopKey = parts[0];
-      const message = parts.slice(1).join(' ');
-      addMessageBubble('user', text.trim());
-
-      if (!loopKey || !message) {
-        addMessageBubble('model', `⚠️ Usage: \`/loop send <key> <message>\``);
-        return true;
-      }
-
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        addMessageBubble('model', `⚠️ ${tl('msgUpstashNotConfigured')}`);
-        return true;
-      }
-
-      const bubble = addMessageBubble('model', `⏳ Sending message to **${loopKey}**…`);
-      (async () => {
-        try {
-          await LoopAgent.sendMessage(upstashUrl, upstashToken, loopKey, message);
-          bubble.innerHTML = renderMarkdown(`✅ Message sent to **${loopKey}**.\n\nThe agent will respond via Pushoo notification. You can also poll the response with \`/loop send ${loopKey} <next message>\``);
-        } catch (e) {
-          bubble.innerHTML = renderMarkdown(`❌ Failed: ${e.message}`);
-        }
-      })();
-      return true;
-    }
-
-    // ─── /loop roll — Ask all running loop agents to identify themselves ──
-    if (cmd === '/loop roll') {
-      addMessageBubble('user', '/loop roll');
-
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        addMessageBubble('model', `⚠️ ${tl('msgUpstashNotConfigured')}`);
-        return true;
-      }
-
-      const cfg = getSessionConfig(currentSessionId);
-      const keys = cfg.loopKeys || [];
-      if (keys.length === 0) {
-        addMessageBubble('model', `⚠️ No loop agents found in this session.`);
-        return true;
-      }
-
-      const bubble = addMessageBubble('model', `⏳ Sending roll call to ${keys.length} agent(s)…`);
-      (async () => {
-        try {
-          // Send __ROLL_CALL__ to all known loop agents
-          for (const key of keys) {
-            await LoopAgent.sendMessage(upstashUrl, upstashToken, key, '__ROLL_CALL__');
-          }
-          // Wait for responses (give agents time to respond)
-          await new Promise(r => setTimeout(r, 8000));
-
-          const lines = [`**📋 Roll Call Results:**\n`];
-          for (const key of keys) {
-            const resp = await LoopAgent.readResponse(upstashUrl, upstashToken, key);
-            if (resp && resp.text) {
-              lines.push(resp.text);
-            } else {
-              const status = await LoopAgent.getStatus(upstashUrl, upstashToken, key);
-              lines.push(`⚪ **${key}** — no response (${status?.state || 'unknown'})`);
-            }
-            lines.push('');
-          }
-          bubble.innerHTML = renderMarkdown(lines.join('\n'));
-        } catch (e) {
-          bubble.innerHTML = renderMarkdown(`❌ Roll call failed: ${e.message}`);
-        }
-      })();
-      return true;
-    }
-
-    // ─── /loop focus <key> — Focus on one agent, others go dormant ──
-    if (cmd.startsWith('/loop focus')) {
-      const targetKey = text.trim().slice('/loop focus'.length).trim();
-      addMessageBubble('user', text.trim());
-
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        addMessageBubble('model', `⚠️ ${tl('msgUpstashNotConfigured')}`);
-        return true;
-      }
-
-      const cfg = getSessionConfig(currentSessionId);
-      const keys = cfg.loopKeys || [];
-
-      if (!targetKey) {
-        if (keys.length === 0) {
-          addMessageBubble('model', `⚠️ No loop agents found.\n\nUsage: \`/loop focus <key>\``);
-        } else {
-          addMessageBubble('model', `**Available agents:**\n${keys.map(k => `- \`${k}\``).join('\n')}\n\nUsage: \`/loop focus <key>\` — makes only that agent respond, others go dormant.`);
-        }
-        return true;
-      }
-
-      if (!keys.includes(targetKey)) {
-        addMessageBubble('model', `⚠️ Unknown loop key **${escapeHtml(targetKey)}**.\n\nAvailable: ${keys.map(k => `\`${k}\``).join(', ')}`);
-        return true;
-      }
-
-      const bubble = addMessageBubble('model', `⏳ Focusing on **${escapeHtml(targetKey)}**…`);
-      (async () => {
-        try {
-          // Send __FOCUS__:<key> to all known loop agents
-          for (const key of keys) {
-            await LoopAgent.sendMessage(upstashUrl, upstashToken, key, `__FOCUS__:${targetKey}`);
-          }
-          await new Promise(r => setTimeout(r, 6000));
-
-          const lines = [`**🎯 Focus Results:**\n`];
-          for (const key of keys) {
-            const resp = await LoopAgent.readResponse(upstashUrl, upstashToken, key);
-            if (resp && resp.text) {
-              lines.push(resp.text);
-            } else {
-              lines.push(`⚪ **${key}** — no response`);
-            }
-          }
-          lines.push(`\nOnly **${targetKey}** will respond to messages now. Use \`/loop wake\` to reactivate all.`);
-          bubble.innerHTML = renderMarkdown(lines.join('\n'));
-        } catch (e) {
-          bubble.innerHTML = renderMarkdown(`❌ Focus failed: ${e.message}`);
-        }
-      })();
-      return true;
-    }
-
-    // ─── /loop wake — Wake all dormant loop agents ──
-    if (cmd === '/loop wake') {
-      addMessageBubble('user', '/loop wake');
-
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        addMessageBubble('model', `⚠️ ${tl('msgUpstashNotConfigured')}`);
-        return true;
-      }
-
-      const cfg = getSessionConfig(currentSessionId);
-      const keys = cfg.loopKeys || [];
-      if (keys.length === 0) {
-        addMessageBubble('model', `⚠️ No loop agents found in this session.`);
-        return true;
-      }
-
-      const bubble = addMessageBubble('model', `⏳ Waking ${keys.length} agent(s)…`);
-      (async () => {
-        try {
-          for (const key of keys) {
-            await LoopAgent.sendMessage(upstashUrl, upstashToken, key, '__WAKE__');
-          }
-          await new Promise(r => setTimeout(r, 6000));
-
-          const lines = [`**🟢 Wake Results:**\n`];
-          for (const key of keys) {
-            const resp = await LoopAgent.readResponse(upstashUrl, upstashToken, key);
-            if (resp && resp.text) {
-              lines.push(resp.text);
-            } else {
-              lines.push(`⚪ **${key}** — no response`);
-            }
-          }
-          bubble.innerHTML = renderMarkdown(lines.join('\n'));
-        } catch (e) {
-          bubble.innerHTML = renderMarkdown(`❌ Wake failed: ${e.message}`);
-        }
-      })();
-      return true;
-    }
-
-    if (cmd.startsWith('/loop sync')) {
-      const loopKeyArg = text.trim().slice('/loop sync'.length).trim();
+    // ─── /loop connect <key> — Connect to a running loop agent ────────
+    if (cmd.startsWith('/loop connect')) {
+      const loopKeyArg = text.trim().slice('/loop connect'.length).trim();
       addMessageBubble('user', text.trim());
 
       if (!loopKeyArg) {
@@ -2467,102 +2193,145 @@ const App = (() => {
         const cfg = getSessionConfig(currentSessionId);
         const keys = cfg.loopKeys || [];
         if (keys.length === 0) {
-          addMessageBubble('model', `⚠️ No loop agents found in this session.\n\nUsage: \`/loop sync <key>\``);
+          addMessageBubble('model', `⚠️ No loop agents found in this session.\n\nUsage: \`/loop connect <key>\``);
         } else {
-          addMessageBubble('model', `**Loop keys in this session:**\n${keys.map(k => `- \`${k}\``).join('\n')}\n\nUsage: \`/loop sync <key>\``);
+          addMessageBubble('model', `**Loop keys in this session:**\n${keys.map(k => `- \`/loop connect ${k}\``).join('\n')}`);
         }
         return true;
       }
+
+      // Disconnect previous connection if any
+      disconnectLoopAgent();
 
       let config;
       try { config = getActionConfig(); }
-      catch (e) {
-        addMessageBubble('model', `⚠️ ${e.message}`);
-        return true;
-      }
+      catch (e) { addMessageBubble('model', `⚠️ ${e.message}`); return true; }
 
-      const bubble = addMessageBubble('model', `⏳ Syncing conversation from loop agent **${escapeHtml(loopKeyArg)}**…`);
+      const cfg = getSessionConfig(currentSessionId);
+      const upstashUrl = cfg.upstashUrl || '';
+      const upstashToken = cfg.upstashToken || '';
+      const encryptKey = _loopEncryptKey || '';
+
+      const bubble = addMessageBubble('model', `⏳ Connecting to loop agent **${escapeHtml(loopKeyArg)}**…`);
+
       (async () => {
         try {
-          // Use current loop encrypt key if we're in loop mode for this key, or check session config
-          const syncCfg = getSessionConfig(currentSessionId);
-          const needsDecrypt = syncCfg.loopEncrypted?.[loopKeyArg];
-          let syncEncryptKey = (_loopModeKey === loopKeyArg) ? _loopEncryptKey : null;
-
-          function showKeyPrompt() {
-            bubble.innerHTML = `
-              <div class=\"schedule-wizard\" style=\"max-width:400px;\">
-                <div class=\"schedule-wizard-title\">🔐 Encrypted — ${escapeHtml(loopKeyArg)}</div>
-                <label class=\"schedule-field-label\">Enter decryption key</label>
-                <input id=\"loop-sync-key-input\" class=\"schedule-input\" type=\"password\" placeholder=\"Encryption passphrase…\" autocomplete=\"off\" />
-                <div class=\"schedule-actions\" style=\"margin-top:10px;\">
-                  <button id=\"loop-sync-cancel\" class=\"schedule-btn schedule-btn-secondary\">Cancel</button>
-                  <button id=\"loop-sync-submit\" class=\"schedule-btn schedule-btn-primary\">🔓 Decrypt & Sync</button>
-                </div>
-              </div>
-            `;
-            bubble.querySelector('#loop-sync-cancel').addEventListener('click', () => {
-              bubble.innerHTML = renderMarkdown(`_Sync cancelled._`);
-            });
-            bubble.querySelector('#loop-sync-submit').addEventListener('click', async () => {
-              syncEncryptKey = bubble.querySelector('#loop-sync-key-input').value.trim();
-              if (!syncEncryptKey) { showToast('Please enter the decryption key', 'error'); return; }
-              bubble.innerHTML = renderMarkdown(`⏳ Syncing…`);
-              await doSync(syncEncryptKey);
-            });
+          // Fetch history from the repo to show past conversation
+          let historyMessages = [];
+          try {
+            const syncCfg = getSessionConfig(currentSessionId);
+            const needsDecrypt = syncCfg.loopEncrypted?.[loopKeyArg];
+            const key = needsDecrypt ? encryptKey : null;
+            historyMessages = await LoopAgent.fetchHistory(config, loopKeyArg, 'loop-agent/history', key);
+          } catch (e) {
+            console.warn(`[Loop Connect] History fetch failed: ${e.message}`);
           }
 
-          // If encrypted but no key in memory, prompt user
-          if (needsDecrypt && !syncEncryptKey) {
-            showKeyPrompt();
-            return;
-          }
-          await doSync(syncEncryptKey);
+          // Activate connected mode
+          _loopConnectedKey = loopKeyArg;
 
-          async function doSync(key) {
-            try {
-              const history = await LoopAgent.fetchHistory(config, loopKeyArg, 'loop-agent/history', key);
-              if (!history || history.length === 0) {
-                bubble.innerHTML = renderMarkdown(`⚠️ No conversation history found for **${loopKeyArg}**.\\n\\nThe agent may not have processed any messages yet, or the history file doesn't exist.`);
-                return;
-              }
-              const lines = [`## 🔄 Loop Agent Conversation — ${loopKeyArg}\n`, `_${history.length} messages synced from GitHub repo_\n`];
-              for (const msg of history) {
-                const role = msg.role === 'user' ? '👤 **User**' : '🤖 **Agent**';
-                const time = msg.ts ? new Date(msg.ts).toLocaleString() : '';
-                const content = msg.content.length > 500 ? msg.content.slice(0, 500) + '…' : msg.content;
-                lines.push(`${role} ${time ? `_(${time})_` : ''}\n${content}\n`);
-              }
-              bubble.innerHTML = renderMarkdown(lines.join('\n'));
-              // Mark as encrypted in session config so future syncs know to prompt
-              const cfgSave = getSessionConfig(currentSessionId);
-              if (!cfgSave.loopKeys) cfgSave.loopKeys = [];
-              if (!cfgSave.loopKeys.includes(loopKeyArg)) {
-                cfgSave.loopKeys.push(loopKeyArg);
-              }
-              if (key) {
-                if (!cfgSave.loopEncrypted) cfgSave.loopEncrypted = {};
-                cfgSave.loopEncrypted[loopKeyArg] = true;
-              }
-              saveSessionConfig(currentSessionId, cfgSave);
-            } catch (e) {
-              // If content is encrypted but no key was provided, auto-show key prompt
-              if (e.message.includes('encrypted') || e.message.includes('Decryption failed')) {
-                // Update loopEncrypted config so future syncs know to prompt
-                const cfgEnc = getSessionConfig(currentSessionId);
-                if (!cfgEnc.loopEncrypted) cfgEnc.loopEncrypted = {};
-                cfgEnc.loopEncrypted[loopKeyArg] = true;
-                saveSessionConfig(currentSessionId, cfgEnc);
-                showKeyPrompt();
-                return;
-              }
-              bubble.innerHTML = renderMarkdown(`❌ Failed to sync: ${e.message}`);
+          // Show banner
+          const banner = document.getElementById('loop-connect-banner');
+          const keySpan = document.getElementById('loop-connect-key');
+          if (banner && keySpan) {
+            keySpan.textContent = loopKeyArg;
+            banner.classList.remove('hidden');
+            banner.style.display = 'flex';
+          }
+
+          // Save loop key to session config for tracking
+          const cfgSave = getSessionConfig(currentSessionId);
+          if (!cfgSave.loopKeys) cfgSave.loopKeys = [];
+          if (!cfgSave.loopKeys.includes(loopKeyArg)) {
+            cfgSave.loopKeys.push(loopKeyArg);
+          }
+          saveSessionConfig(currentSessionId, cfgSave);
+
+          // Display conversation history
+          if (historyMessages.length > 0) {
+            const lines = [`## 🔄 Loop Agent — ${loopKeyArg}\n`, `_${historyMessages.length} messages from history_\n`];
+            // Show last 20 messages to avoid overflow
+            const recent = historyMessages.slice(-20);
+            if (historyMessages.length > 20) {
+              lines.push(`_…${historyMessages.length - 20} earlier messages omitted_\n`);
             }
+            for (const msg of recent) {
+              const role = msg.role === 'user' ? '👤 **User**' : '🤖 **Agent**';
+              const time = msg.ts ? new Date(msg.ts).toLocaleString() : '';
+              const content = msg.content.length > 500 ? msg.content.slice(0, 500) + '…' : msg.content;
+              lines.push(`${role} ${time ? `_(${time})_` : ''}\n${content}\n`);
+            }
+            lines.push(`---\n_Connected. Type messages below to chat with the loop agent. Use \`/loop disconnect\` to exit._`);
+            bubble.innerHTML = renderMarkdown(lines.join('\n'));
+          } else {
+            bubble.innerHTML = renderMarkdown(`✅ Connected to loop agent **${loopKeyArg}**.\n\n_No previous conversation history found._\n\nType messages below — they will be sent directly to the loop agent. Use \`/loop disconnect\` to exit.`);
           }
+          scrollToBottom();
+
+          // Start background polling for responses (adaptive: slows when idle)
+          const LOOP_POLL_BASE = 3000;
+          const LOOP_POLL_MAX = 18000; // 6x slowdown
+          const LOOP_POLL_SLOW_AFTER = 5;
+          let loopEmptyPolls = 0;
+          let loopCurrentInterval = LOOP_POLL_BASE;
+
+          const loopPollOnce = async () => {
+            if (!_loopConnectedKey) return;
+            try {
+              let pollConfig;
+              try { pollConfig = getActionConfig(); }
+              catch { _loopPollTimer = setTimeout(loopPollOnce, loopCurrentInterval); return; }
+              const pollCfg = getSessionConfig(currentSessionId);
+              const response = await LoopAgent.pollIntervention(pollConfig, _loopConnectedKey, {
+                upstashUrl: pollCfg.upstashUrl || '',
+                upstashToken: pollCfg.upstashToken || '',
+                encryptKey: _loopEncryptKey || '',
+              });
+              if (response && response.text) {
+                addMessageBubble('model', `🤖 **${escapeHtml(_loopConnectedKey)}**:\n\n${response.text}`);
+                scrollToBottom();
+                loopEmptyPolls = 0;
+                loopCurrentInterval = LOOP_POLL_BASE;
+              } else {
+                loopEmptyPolls++;
+                if (loopEmptyPolls >= LOOP_POLL_SLOW_AFTER && loopCurrentInterval === LOOP_POLL_BASE) {
+                  loopCurrentInterval = LOOP_POLL_MAX;
+                  console.log(`[Loop Connect] No responses for ${LOOP_POLL_SLOW_AFTER} polls, slowing to ${loopCurrentInterval / 1000}s`);
+                }
+              }
+            } catch (e) {
+              console.warn(`[Loop Connect] Poll error: ${e.message}`);
+            }
+            if (_loopConnectedKey) {
+              _loopPollTimer = setTimeout(loopPollOnce, loopCurrentInterval);
+            }
+          };
+          _loopPollReset = () => {
+            loopEmptyPolls = 0;
+            loopCurrentInterval = LOOP_POLL_BASE;
+            // Restart timer immediately for fast response
+            if (_loopPollTimer) clearTimeout(_loopPollTimer);
+            _loopPollTimer = setTimeout(loopPollOnce, LOOP_POLL_BASE);
+          };
+          _loopPollTimer = setTimeout(loopPollOnce, LOOP_POLL_BASE);
+
         } catch (e) {
-          bubble.innerHTML = renderMarkdown(`❌ Failed to sync: ${e.message}`);
+          bubble.innerHTML = renderMarkdown(`❌ Failed to connect: ${e.message}`);
         }
       })();
+      return true;
+    }
+
+    // ─── /loop disconnect — Disconnect from the loop agent ────────────
+    if (cmd === '/loop disconnect') {
+      addMessageBubble('user', '/loop disconnect');
+      if (!_loopConnectedKey) {
+        addMessageBubble('model', `ℹ️ Not connected to any loop agent.`);
+      } else {
+        const key = _loopConnectedKey;
+        disconnectLoopAgent();
+        addMessageBubble('model', `✅ Disconnected from loop agent **${escapeHtml(key)}**.`);
+      }
       return true;
     }
 
@@ -2578,10 +2347,11 @@ const App = (() => {
         return true;
       }
 
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        addMessageBubble('model', `⚠️ ${tl('msgUpstashNotConfigured')}`);
+      // Require a bidirectional messaging channel (e.g. Telegram) via Pushoo
+      const pushooConfig = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
+      const hasPushoo = !!(pushooConfig.platform && pushooConfig.token);
+      if (!hasPushoo) {
+        addMessageBubble('model', `⚠️ ${tl('msgMessagingChannelRequired')}`);
         return true;
       }
 
@@ -2597,9 +2367,6 @@ const App = (() => {
       }
 
       const loopKey = LoopAgent.generateLoopKey();
-      const pushooConfig = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
-      // Auto-enable Pushoo if platform and token are configured, regardless of enabled flag
-      const hasPushoo = !!(pushooConfig.platform && pushooConfig.token);
 
       // Build deploy wizard UI
       const bubble = addMessageBubble('model', '');
@@ -2609,7 +2376,7 @@ const App = (() => {
 
           <label class="schedule-field-label">${tl('msgLoopKey')}</label>
           <input id="loop-key-input" class="schedule-input" type="text" value="${escapeHtml(loopKey)}" readonly style="font-family:monospace;background:var(--bg-darker,#111);cursor:text;" />
-          <div class="hint" style="margin-top:2px;">This key identifies the agent. Share it to send messages via Upstash.</div>
+          <div class="hint" style="margin-top:2px;">This key identifies the agent. Messages are delivered via ${escapeHtml(pushooConfig.platform)}.</div>
 
           <label class="schedule-field-label">${tl('msgLoopSystemPrompt')}</label>
           <textarea id="loop-system-prompt" class="schedule-input" rows="3" placeholder="Optional: custom system prompt for the agent..."
@@ -2636,10 +2403,8 @@ const App = (() => {
           <div class="hint" style="margin-top:2px;">Files stored in the repo will be AES-256-GCM encrypted. You will need this key to view history later.</div>
 
           <div class="schedule-notify-row" style="margin-top:10px;">
-            <div class="schedule-checkbox-label" style="opacity:${hasPushoo ? 1 : 0.5}">
-              📢 Pushoo ${hasPushoo
-                ? `<span class="schedule-hint" style="color:#22863a">✅ ${tl('msgAutoNotifyVia')} ${escapeHtml(pushooConfig.platform)}</span>`
-                : `<span class="schedule-hint">(${tl('msgConfigurePushooInSettings')})</span>`}
+            <div class="schedule-checkbox-label">
+              📢 <span class="schedule-hint" style="color:#22863a">✅ ${tl('msgAutoNotifyVia')} ${escapeHtml(pushooConfig.platform)}</span>
             </div>
           </div>
 
@@ -2683,14 +2448,12 @@ const App = (() => {
 
           // Re-read pushoo config fresh (user may have configured it after wizard appeared)
           const freshPushoo = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
-          const pushooReady = !!(freshPushoo.platform && freshPushoo.token);
 
           // Log pushoo config being synced
           console.log('[Loop Deploy] Pushoo config:', {
-            pushooReady,
-            platform: pushooReady ? freshPushoo.platform : '(disabled)',
-            tokenLength: pushooReady ? freshPushoo.token?.length : 0,
-            tokenPreview: pushooReady && freshPushoo.token ? freshPushoo.token.slice(0, 4) + '***' : '(none)',
+            platform: freshPushoo.platform,
+            tokenLength: freshPushoo.token?.length || 0,
+            tokenPreview: freshPushoo.token ? freshPushoo.token.slice(0, 4) + '***' : '(none)',
           });
 
           const result = await LoopAgent.deploy({
@@ -2707,10 +2470,10 @@ const App = (() => {
             },
             secrets: {
               aiApiKey: apiKey,
-              upstashUrl,
-              upstashToken,
-              pushooPlatform: pushooReady ? freshPushoo.platform : undefined,
-              pushooToken: pushooReady ? freshPushoo.token : undefined,
+              upstashUrl: getSessionSetting('upstashUrl') || undefined,
+              upstashToken: getSessionSetting('upstashToken') || undefined,
+              pushooPlatform: freshPushoo.platform,
+              pushooToken: freshPushoo.token,
               encryptKey: encryptKey || undefined,
             },
             onProgress: (step, detail) => {
@@ -2740,7 +2503,7 @@ const App = (() => {
               <div style="margin-bottom:16px;">
                 <div style="font-weight:500;margin-bottom:4px;">🔑 Your Loop Key:</div>
                 <code style="display:block;padding:8px 12px;background:var(--bg-darker,#111);border-radius:4px;font-size:14px;letter-spacing:0.5px;user-select:all;">${escapeHtml(loopKey)}</code>
-                <div class="hint" style="margin-top:4px;">Use this key to send messages to the agent via Upstash.</div>
+                <div class="hint" style="margin-top:4px;">This key identifies the agent instance.</div>
               </div>
 
               <div style="margin-bottom:12px;">
@@ -2753,10 +2516,9 @@ const App = (() => {
 
               <div style="font-size:13px;opacity:.8;margin-bottom:12px;">
                 <strong>How to interact:</strong><br>
-                • <code>/loop send ${escapeHtml(loopKey)} your message here</code><br>
-                • <code>/loop status</code> to check agent status<br>
-                • <code>/loop sync ${escapeHtml(loopKey)}</code> to sync conversation history back<br>
-                • Or send messages directly via Telegram (if configured)
+                • <code>/loop connect ${escapeHtml(loopKey)}</code> to chat with the agent directly from here<br>
+                • Send messages via ${escapeHtml(freshPushoo.platform)} — the agent will reply there<br>
+                • <code>/loop status</code> to check agent status
               </div>
 
               <div style="display:flex;gap:8px;">
@@ -2796,29 +2558,37 @@ const App = (() => {
       return;
     }
 
-    // ─── Loop mode intercept ─────────────────────────────────────────
-    // In loop mode, slash commands still go through normal dispatch,
-    // but regular messages are sent directly to the loop agent.
-    if (_loopModeKey && !text.startsWith('/')) {
+    // ── Loop connect mode intercept ──
+    // When connected to a loop agent, send messages to the agent instead of the normal AI chat
+    if (_loopConnectedKey && !text.startsWith('/')) {
       input.value = '';
       autoResizeInput();
-
-      const upstashUrl = getSessionSetting('upstashUrl');
-      const upstashToken = getSessionSetting('upstashToken');
-      if (!upstashUrl || !upstashToken) {
-        showToast('Upstash not configured', 'error');
-        return;
-      }
-
       addMessageBubble('user', text);
-      _loopLastResponseTs = Date.now(); // Update timestamp so we catch the response
-
-      try {
-        await LoopAgent.sendMessage(upstashUrl, upstashToken, _loopModeKey, text);
-      } catch (e) {
-        addMessageBubble('model', `❌ Failed to send to loop agent: ${e.message}`);
-      }
+      const bubble = addMessageBubble('model', `⏳ Sending to **${escapeHtml(_loopConnectedKey)}**…`);
       scrollToBottom();
+
+      (async () => {
+        try {
+          let config;
+          try { config = getActionConfig(); }
+          catch (e) { bubble.innerHTML = renderMarkdown(`⚠️ ${e.message}`); return; }
+
+          const cfg = getSessionConfig(currentSessionId);
+          const upstashUrl = cfg.upstashUrl || '';
+          const upstashToken = cfg.upstashToken || '';
+          const encryptKey = _loopEncryptKey || '';
+
+          const result = await LoopAgent.sendIntervention(config, _loopConnectedKey, text, {
+            upstashUrl, upstashToken, encryptKey,
+          });
+          bubble.innerHTML = renderMarkdown(`📤 Sent via **${result.channel}**. Waiting for reply…`);
+          scrollToBottom();
+          // Reset adaptive polling to fast mode after sending
+          if (_loopPollReset) _loopPollReset();
+        } catch (e) {
+          bubble.innerHTML = renderMarkdown(`❌ Failed to send: ${e.message}`);
+        }
+      })();
       return;
     }
 
@@ -3100,7 +2870,7 @@ const App = (() => {
     $('#set-action-workflow').value = get('actionWorkflow', 'execute.yml');
     $('#set-action-dir').value = get('actionArtifactDir', 'artifacts');
 
-    // Upstash / Loop Agent settings
+    // Upstash settings (optional, for loop agent browser intervention)
     $('#set-upstash-url').value = get('upstashUrl', '');
     $('#set-upstash-token').value = get('upstashToken', '');
 
@@ -5091,168 +4861,6 @@ const App = (() => {
     if (sendBtn) sendBtn.disabled = !enabled;
   }
 
-  // ─── Loop Mode Management ─────────────────────────────────────────
-
-  /**
-   * Load history (optionally decrypt) and enter loop conversation mode.
-   * Called from /loop join after optional key prompt.
-   */
-  async function loadAndJoinLoop(loopKeyArg, bubble, encryptKey) {
-    try {
-      let config;
-      try { config = getActionConfig(); } catch { config = null; }
-
-      // Try to load history from GitHub (pass encryptKey for decryption)
-      let history = [];
-      if (config) {
-        try { history = await LoopAgent.fetchHistory(config, loopKeyArg, 'loop-agent/history', encryptKey); } catch (e) {
-          if (e.message.includes('Decryption failed')) {
-            bubble.innerHTML = renderMarkdown(`❌ ${e.message}`);
-            return;
-          }
-          // Auto-detect encrypted content and prompt for key
-          if (e.message.includes('encrypted')) {
-            // Update loopEncrypted config so future joins know to prompt
-            const cfgEnc = getSessionConfig(currentSessionId);
-            if (!cfgEnc.loopEncrypted) cfgEnc.loopEncrypted = {};
-            cfgEnc.loopEncrypted[loopKeyArg] = true;
-            saveSessionConfig(currentSessionId, cfgEnc);
-            // Re-use the showJoinKeyPrompt from the caller scope if available,
-            // otherwise show inline prompt
-            bubble.innerHTML = `
-              <div class="schedule-wizard" style="max-width:400px;">
-                <div class="schedule-wizard-title">🔐 Encrypted Loop — ${escapeHtml(loopKeyArg)}</div>
-                <p style="margin:6px 0;font-size:13px;">This loop agent's history is encrypted.</p>
-                <label class="schedule-field-label">Enter decryption key</label>
-                <input id="loop-join-key-retry" class="schedule-input" type="password" placeholder="Encryption passphrase…" autocomplete="off" />
-                <div class="schedule-actions" style="margin-top:10px;">
-                  <button id="loop-join-retry-cancel" class="schedule-btn schedule-btn-secondary">Cancel</button>
-                  <button id="loop-join-retry-submit" class="schedule-btn schedule-btn-primary">🔓 Decrypt & Join</button>
-                </div>
-              </div>
-            `;
-            bubble.querySelector('#loop-join-retry-cancel').addEventListener('click', () => {
-              bubble.innerHTML = renderMarkdown(`_Join cancelled._`);
-            });
-            bubble.querySelector('#loop-join-retry-submit').addEventListener('click', async () => {
-              const inputKey = bubble.querySelector('#loop-join-key-retry').value.trim();
-              if (!inputKey) { showToast('Please enter the decryption key', 'error'); return; }
-              bubble.innerHTML = renderMarkdown(`⏳ Loading conversation history for **${escapeHtml(loopKeyArg)}**…`);
-              await loadAndJoinLoop(loopKeyArg, bubble, inputKey);
-            });
-            return;
-          }
-          /* other fetch errors: ignore, show no history */
-        }
-      }
-
-      // Display previous conversation
-      if (history.length > 0) {
-        const lines = [`## 🔄 Loop Conversation — ${loopKeyArg}\n`, `_${history.length} messages loaded_\n`];
-        const recent = history.slice(-20);
-        if (history.length > 20) lines.push(`_(showing last 20 of ${history.length})_\n`);
-        for (const msg of recent) {
-          const role = msg.role === 'user' ? '👤' : '🤖';
-          const time = msg.ts ? new Date(msg.ts).toLocaleTimeString() : '';
-          const content = msg.content.length > 300 ? msg.content.slice(0, 300) + '…' : msg.content;
-          lines.push(`${role} ${time ? `_(${time})_ ` : ''}${content}\n`);
-        }
-        bubble.innerHTML = renderMarkdown(lines.join('\n'));
-      } else {
-        bubble.innerHTML = renderMarkdown(`🔄 Joined **${loopKeyArg}** — no previous messages found.\n\nStart typing below to talk to the loop agent.`);
-      }
-
-      // Store encryption key in memory for this loop session
-      _loopEncryptKey = encryptKey || null;
-
-      // Enter loop mode
-      enterLoopMode(loopKeyArg);
-
-      // Track this loop key in session config
-      const cfg = getSessionConfig(currentSessionId);
-      if (!cfg.loopKeys) cfg.loopKeys = [];
-      if (!cfg.loopKeys.includes(loopKeyArg)) {
-        cfg.loopKeys.push(loopKeyArg);
-      }
-      // Mark as encrypted if a key was used, so future joins/syncs know to prompt
-      if (encryptKey) {
-        if (!cfg.loopEncrypted) cfg.loopEncrypted = {};
-        cfg.loopEncrypted[loopKeyArg] = true;
-      }
-      saveSessionConfig(currentSessionId, cfg);
-    } catch (e) {
-      bubble.innerHTML = renderMarkdown(`❌ Failed to join: ${e.message}`);
-    }
-  }
-
-  function enterLoopMode(loopKey) {
-    _loopModeKey = loopKey;
-    _loopLastResponseTs = Date.now();
-
-    // Show the context banner
-    const banner = $('#loop-context-banner');
-    const keyLabel = $('#loop-context-key');
-    const exitBtn = $('#loop-context-exit');
-    if (banner) {
-      keyLabel.textContent = loopKey;
-      banner.classList.remove('hidden');
-    }
-    if (exitBtn) {
-      exitBtn.onclick = () => {
-        exitLoopMode();
-        addMessageBubble('model', `✅ Left loop conversation mode.`);
-      };
-    }
-
-    // Update input placeholder
-    const input = $('#message-input');
-    if (input) input.placeholder = `Message loop agent ${loopKey}… (type /loop leave to exit)`;
-
-    // Start polling for responses
-    startLoopPolling();
-  }
-
-  function exitLoopMode() {
-    _loopModeKey = null;
-    _loopEncryptKey = null;
-    stopLoopPolling();
-
-    // Hide the context banner
-    const banner = $('#loop-context-banner');
-    if (banner) banner.classList.add('hidden');
-
-    // Restore input placeholder
-    const input = $('#message-input');
-    if (input) input.placeholder = tl('inputEnabled');
-  }
-
-  function startLoopPolling() {
-    stopLoopPolling();
-    const upstashUrl = getSessionSetting('upstashUrl');
-    const upstashToken = getSessionSetting('upstashToken');
-    if (!upstashUrl || !upstashToken || !_loopModeKey) return;
-
-    _loopPollTimer = setInterval(async () => {
-      if (!_loopModeKey) { stopLoopPolling(); return; }
-      try {
-        const resp = await LoopAgent.pollResponse(upstashUrl, upstashToken, _loopModeKey, _loopLastResponseTs);
-        if (resp) {
-          _loopLastResponseTs = resp.ts || Date.now();
-          const text = typeof resp === 'string' ? resp : (resp.text || resp.content || JSON.stringify(resp));
-          addMessageBubble('model', renderMarkdown(`🤖 **${_loopModeKey}**:\n\n${text}`), true);
-          scrollToBottom();
-        }
-      } catch { /* polling error — silently retry */ }
-    }, 3000); // Poll every 3 seconds
-  }
-
-  function stopLoopPolling() {
-    if (_loopPollTimer) {
-      clearInterval(_loopPollTimer);
-      _loopPollTimer = null;
-    }
-  }
-
   // ─── Restore Sessions from GitHub ─────────────────────────────────
 
   function openRestoreDialog() {
@@ -5436,6 +5044,15 @@ const App = (() => {
       Chat.abort();
       setStreamingState(false);
       showToast(tl('toastGenerationStopped'), 'info');
+    });
+
+    // Loop agent disconnect button
+    $('#loop-disconnect-btn')?.addEventListener('click', () => {
+      if (_loopConnectedKey) {
+        const key = _loopConnectedKey;
+        disconnectLoopAgent();
+        addMessageBubble('model', `✅ Disconnected from loop agent **${escapeHtml(key)}**.`);
+      }
     });
 
     $('#message-input')?.addEventListener('keydown', (e) => {
@@ -5629,31 +5246,6 @@ const App = (() => {
 
     ['pushoo-config-cancel', 'pushoo-config-close'].forEach(id => {
       $(`#${id}`)?.addEventListener('click', () => hide(pushooDialog));
-    });
-
-    // Test Upstash connection button
-    $('#test-upstash-btn')?.addEventListener('click', async () => {
-      const btn = $('#test-upstash-btn');
-      const result = $('#upstash-test-result');
-      const url = $('#set-upstash-url').value.trim();
-      const token = $('#set-upstash-token').value.trim();
-      if (!url || !token) {
-        if (result) { result.textContent = '⚠️ Enter URL and token first'; result.style.color = '#e67e22'; }
-        return;
-      }
-      btn.disabled = true;
-      if (result) { result.textContent = 'Testing…'; result.style.color = '#888'; }
-      try {
-        const res = await LoopAgent.testUpstash(url, token);
-        if (res.ok) {
-          if (result) { result.textContent = '✅ Connected!'; result.style.color = '#27ae60'; }
-        } else {
-          if (result) { result.textContent = `❌ ${res.error}`; result.style.color = '#e74c3c'; }
-        }
-      } catch (e) {
-        if (result) { result.textContent = `❌ ${e.message}`; result.style.color = '#e74c3c'; }
-      }
-      btn.disabled = false;
     });
 
     // Collapsible sections
