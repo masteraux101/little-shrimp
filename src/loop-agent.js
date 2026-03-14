@@ -63,19 +63,17 @@ const LoopAgent = (() => {
       'jobs:',
       '  loop-agent:',
       '    runs-on: ubuntu-latest',
+      '    container:',
+      '      image: mcr.microsoft.com/playwright:v1.50.0-noble',
+      '      options: --ipc=host',
       '    timeout-minutes: 360',
       '    steps:',
       '      - uses: actions/checkout@v4',
       '',
-      '      - name: Setup Node.js',
-      '        uses: actions/setup-node@v4',
-      '        with:',
-      "          node-version: '20'",
-      '',
       '      - name: Install dependencies',
       '        run: |',
       '          cd loop-agent',
-      '          npm install pushoo telegraf zod @langchain/core @langchain/langgraph @langchain/google-genai @langchain/openai 2>&1',
+      '          npm install pushoo telegraf @wecom/aibot-node-sdk zod @langchain/core @langchain/langgraph @langchain/google-genai @langchain/openai playwright@1.50.0 sharp 2>&1',
       '',
       '      - name: Run loop agent',
       '        env:',
@@ -85,8 +83,7 @@ const LoopAgent = (() => {
       `          AI_PROVIDER: "${provider}"`,
       `          AI_MODEL: "${model}"`,
       '          AI_API_KEY: ${{ secrets.AI_API_KEY }}',
-      '          PUSHOO_PLATFORM: ${{ secrets.PUSHOO_PLATFORM }}',
-      '          PUSHOO_TOKEN: ${{ secrets.PUSHOO_TOKEN }}',
+      '          PUSHOO_CHANNELS: ${{ secrets.PUSHOO_CHANNELS }}',
       '          GH_PAT: ${{ secrets.GH_PAT }}',
       '          GITHUB_REPOSITORY: ${{ github.repository }}',
       `          LOOP_WORKFLOW_FILE: "${workflowFile}"`,
@@ -108,7 +105,7 @@ const LoopAgent = (() => {
    * @param {string} opts.runnerScript - The runner.js content
    * @param {string} opts.loopKey - Unique loop key
    * @param {Object} opts.agentOpts - { provider, model, pollInterval, maxRuntime, systemPrompt }
-   * @param {Object} opts.secrets - { aiApiKey, pushooPlatform, pushooToken }
+   * @param {Object} opts.secrets - { aiApiKey, pushooChannels }
    * @param {function} opts.onProgress - (step, detail) progress callback
    * @returns {Object} { loopKey, workflowFile, repoUrl }
    */
@@ -158,8 +155,7 @@ const LoopAgent = (() => {
     if (secrets.upstashUrl)     secretMap.push({ name: 'UPSTASH_URL',     value: secrets.upstashUrl });
     if (secrets.upstashToken)   secretMap.push({ name: 'UPSTASH_TOKEN',   value: secrets.upstashToken });
     if (secrets.aiApiKey)       secretMap.push({ name: 'AI_API_KEY',      value: secrets.aiApiKey });
-    if (secrets.pushooPlatform) secretMap.push({ name: 'PUSHOO_PLATFORM', value: secrets.pushooPlatform });
-    if (secrets.pushooToken)    secretMap.push({ name: 'PUSHOO_TOKEN',    value: secrets.pushooToken });
+    if (secrets.pushooChannels) secretMap.push({ name: 'PUSHOO_CHANNELS', value: secrets.pushooChannels });
     // Use the user's PAT (not the default GITHUB_TOKEN) for repo operations
     if (actionConfig.token)     secretMap.push({ name: 'GH_PAT',          value: actionConfig.token });
     if (secrets.encryptKey)      secretMap.push({ name: 'LOOP_ENCRYPT_KEY', value: secrets.encryptKey });
@@ -460,6 +456,28 @@ const LoopAgent = (() => {
     } catch { return null; }
   }
 
+  /**
+   * Clean up Upstash keys for a given loop agent.
+   * Deletes both inbox and outbox keys.
+   */
+  async function cleanupUpstashKeys(loopKey, opts = {}) {
+    const { upstashUrl, upstashToken } = opts;
+    if (!upstashUrl || !upstashToken) return;
+    const keys = [`loop:${loopKey}:inbox`, `loop:${loopKey}:outbox`];
+    for (const key of keys) {
+      try {
+        await fetch(upstashUrl.replace(/\/+$/, ''), {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${upstashToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(['DEL', key]),
+        });
+      } catch { /* ignore cleanup errors */ }
+    }
+  }
+
   return {
     getRunnerScript,
     generateLoopKey,
@@ -469,6 +487,7 @@ const LoopAgent = (() => {
     clearMemory,
     sendIntervention,
     pollIntervention,
+    cleanupUpstashKeys,
   };
 })();
 

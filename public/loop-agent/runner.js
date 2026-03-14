@@ -6,11 +6,14 @@
  *                               → Execute  (params complete)
  *
  * Two input modes:
- *   1. Telegram mode — When PUSHOO_PLATFORM is "telegram", uses Telegraf
- *      long-polling to receive user messages directly from Telegram and
- *      replies via Telegram. Upstash is optional (status tracking only).
- *   2. Upstash mode  — Polls Upstash for user messages, sends results via
- *      Pushoo, and persists conversation history to the repo.
+ *   1. Telegram mode — When PUSHOO_CHANNELS contains a "telegram" channel,
+ *      uses Telegraf long-polling to receive user messages directly from
+ *      Telegram and replies via Telegram. Upstash is optional (status tracking only).
+ *   2. WeCom mode — When PUSHOO_CHANNELS contains a "wecombot" channel,
+ *      uses @wecom/aibot-node-sdk WebSocket long-connection for bidirectional
+ *      messaging with Enterprise WeChat (企业微信).
+ *   3. Upstash mode  — Polls Upstash for user messages, sends results via
+ *      multi-channel notifications, and persists conversation history to the repo.
  *
  * Environment variables (set as repo secrets/vars):
  *   UPSTASH_URL       — Upstash Redis REST URL (required in Upstash mode)
@@ -19,8 +22,8 @@
  *   AI_PROVIDER       — gemini | qwen | kimi
  *   AI_MODEL          — Model ID
  *   AI_API_KEY        — Provider API key
- *   PUSHOO_PLATFORM   — Pushoo platform name (if "telegram", enables Telegram mode)
- *   PUSHOO_TOKEN      — Pushoo platform token (for Telegram: botToken#chatId)
+ *   PUSHOO_CHANNELS   — JSON array of {platform, token} for multi-channel notifications
+ *                        (legacy: PUSHOO_PLATFORM + PUSHOO_TOKEN still supported as fallback)
  *   GITHUB_TOKEN      — GitHub PAT for repo operations
  *   GITHUB_REPOSITORY — owner/repo (auto-set by Actions)
  *   LOOP_HISTORY_PATH — Path in repo for history file (default: loop-agent/history)
@@ -181,6 +184,30 @@ class RepoStore {
     }
     return resp.json();
   }
+
+  /**
+   * Write a file WITHOUT encryption, even if _encryptKey is set.
+   * Use this for files that must remain plain text (e.g. workflow YAML, executable scripts).
+   */
+  async writeFileRaw(path, content, message, branch = 'main') {
+    const existing = await this.readFile(path, branch);
+    const body = {
+      message,
+      content: Buffer.from(content).toString('base64'),
+      branch,
+    };
+    if (existing) body.sha = existing.sha;
+
+    const resp = await fetch(
+      `${this.api}/repos/${this.owner}/${this.repo}/contents/${path}`,
+      { method: 'PUT', headers: this._headers(), body: JSON.stringify(body) }
+    );
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(`GitHub write error: ${resp.status} ${err.message || ''}`);
+    }
+    return resp.json();
+  }
 }
 
 // ─── Pushoo Notification ────────────────────────────────────────────
@@ -196,6 +223,58 @@ async function sendPushoo(platform, token, title, content) {
     console.log(`[Pushoo] Notification sent via ${platform}`);
   } catch (e) {
     console.warn(`[Pushoo] Failed: ${e.message}`);
+  }
+}
+
+/**
+ * Parse PUSHOO_CHANNELS env var (JSON array of { platform, token }).
+ * Falls back to legacy PUSHOO_PLATFORM + PUSHOO_TOKEN if PUSHOO_CHANNELS is not set.
+ */
+function parsePushooChannels() {
+  const channelsJson = process.env.PUSHOO_CHANNELS;
+  if (channelsJson) {
+    try {
+      const channels = JSON.parse(channelsJson);
+      if (Array.isArray(channels) && channels.length > 0) return channels;
+    } catch (e) {
+      console.warn(`[Pushoo] Failed to parse PUSHOO_CHANNELS: ${e.message}`);
+    }
+  }
+  // Legacy fallback
+  const platform = process.env.PUSHOO_PLATFORM;
+  const token = process.env.PUSHOO_TOKEN;
+  if (platform && token) return [{ platform, token }];
+  return [];
+}
+
+/**
+ * Send notification to all configured pushoo channels.
+ * Telegram channels use direct Bot API; wecombot is skipped (bidirectional only);
+ * all other platforms use the pushoo library.
+ */
+async function sendNotifications(channels, title, content) {
+  if (!channels || channels.length === 0) return;
+  for (const ch of channels) {
+    try {
+      if (ch.platform === 'telegram') {
+        const { botToken, chatId } = parseTelegramToken(ch.token);
+        if (botToken && chatId) {
+          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: `${title}\n\n${content}`.slice(0, 4000) }),
+          });
+          console.log(`[Notify] Telegram notification sent`);
+        }
+      } else if (ch.platform === 'wecombot') {
+        // WeCom Bot is bidirectional — skip one-way notifications
+        console.log(`[Notify] WeCom Bot: skipped (bidirectional only)`);
+      } else {
+        await sendPushoo(ch.platform, ch.token, title, content);
+      }
+    } catch (e) {
+      console.warn(`[Notify] ${ch.platform} failed: ${e.message}`);
+    }
   }
 }
 
@@ -234,10 +313,140 @@ function splitTelegramMessage(text, maxLen = 4000) {
 }
 
 /**
+ * Split a WeCom message into chunks (max 2000 chars per message).
+ */
+function splitWecomMessage(text, maxLen = 2000) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt < maxLen * 0.3) splitAt = maxLen;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  return chunks;
+}
+
+/**
  * Check if the platform string refers to Telegram.
  */
 function isTelegramPlatform(platform) {
   return platform && platform.toLowerCase() === 'telegram';
+}
+
+/**
+ * Send a photo to Telegram via Bot API.
+ * Reads PUSHOO_CHANNELS from env to find the telegram channel.
+ * Validates image integrity and optimizes dimensions before sending.
+ */
+async function sendTelegramPhoto(imagePath, caption) {
+  const channels = parsePushooChannels();
+  const telegramCh = channels.find(ch => ch.platform === 'telegram');
+  if (!telegramCh) return null;
+
+  const { botToken, chatId } = parseTelegramToken(telegramCh.token);
+  if (!botToken || !chatId) return null;
+
+  const fs = require('fs');
+  const path = require('path');
+  const sharp = require('sharp');
+
+  try {
+    // 1. Validate image exists and read metadata
+    if (!fs.existsSync(imagePath)) {
+      console.error(`[Telegram] Image file not found: ${imagePath}`);
+      return null;
+    }
+
+    const imageData = fs.readFileSync(imagePath);
+    console.log(`[Telegram] Read image (${(imageData.length / 1024).toFixed(1)}KB): ${imagePath}`);
+
+    // 2. Validate image using Sharp and get metadata
+    let metadata;
+    try {
+      metadata = await sharp(imagePath).metadata();
+      console.log(`[Telegram] Image metadata - size: ${metadata.width}x${metadata.height}px, format: ${metadata.format}`);
+    } catch (e) {
+      console.error(`[Telegram] Failed to read image metadata: ${e.message}`);
+      return null;
+    }
+
+    // 3. Validate dimensions (Telegram requires valid dimensions)
+    if (!metadata.width || !metadata.height || metadata.width < 1 || metadata.height < 1) {
+      console.error(`[Telegram] Invalid image dimensions: ${metadata.width}x${metadata.height}`);
+      return null;
+    }
+
+    // 4. Optimize image if too large (Telegram sendPhoto has size limits)
+    let processedBuffer = imageData;
+    const MAX_DIMENSION = 2560; // Telegram recommended max
+    const MIN_DIMENSION = 50;   // Ensure minimum viable size
+
+    if (metadata.width > MAX_DIMENSION || metadata.height > MAX_DIMENSION) {
+      console.log(`[Telegram] Image too large (${metadata.width}x${metadata.height}), resizing to max ${MAX_DIMENSION}px...`);
+      processedBuffer = await sharp(imagePath)
+        .resize(MAX_DIMENSION, MAX_DIMENSION, { fit: 'inside', withoutEnlargement: true })
+        .png({ quality: 80, progressive: true })
+        .toBuffer();
+      console.log(`[Telegram] Resized image (${(processedBuffer.length / 1024).toFixed(1)}KB)`);
+    }
+
+    // 5. Validate file size for endpoint choice
+    const sizeMB = processedBuffer.length / (1024 * 1024);
+    const endpoint = sizeMB > 10 ? 'sendDocument' : 'sendPhoto';
+    const fieldName = sizeMB > 10 ? 'document' : 'photo';
+
+    // 6. Prepare form data
+    const filename = path.basename(imagePath);
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    
+    // Prepare caption - Telegram sendPhoto caption limit is 1024, sendDocument is 1024 too
+    if (caption) {
+      form.append('caption', caption.slice(0, 1024));
+      form.append('parse_mode', 'HTML'); // Allow basic HTML formatting in caption
+    }
+
+    // 7. Send as Blob with correct MIME type
+    const mimeType = 'image/png';
+    form.append(fieldName, new Blob([processedBuffer], { type: mimeType }), filename);
+
+    // 8. Make API request
+    const url = `https://api.telegram.org/bot${botToken}/${endpoint}`;
+    console.log(`[Telegram] Sending ${endpoint} to chat ${chatId} (${sizeMB.toFixed(2)}MB)...`);
+    
+    const resp = await fetch(url, {
+      method: 'POST',
+      body: form,
+    });
+
+    // 9. Handle response
+    const responseText = await resp.text();
+    if (!resp.ok) {
+      console.error(`[Telegram] ${endpoint} failed (HTTP ${resp.status})`);
+      console.error(`[Telegram] Response: ${responseText}`);
+      return null;
+    }
+
+    // 10. Parse and return success
+    const result = JSON.parse(responseText);
+    if (result.ok) {
+      console.log(`[Telegram] ✓ Photo sent via ${endpoint} (${sizeMB.toFixed(2)}MB) - Message ID: ${result.result.message_id}`);
+      return result.result;
+    } else {
+      console.error(`[Telegram] API returned error: ${result.description}`);
+      return null;
+    }
+  } catch (e) {
+    console.error(`[Telegram] Exception during photo send: ${e.message}`);
+    console.error(`[Telegram] Stack: ${e.stack}`);
+    return null;
+  }
 }
 
 // ─── Self-Restart (Workflow Re-dispatch) ────────────────────────────
@@ -443,16 +652,31 @@ function createBuiltinTools(repoStore) {
     }));
 
     // 6. Write Repo File — write/update a file in the GitHub repository
+    //    Certain paths must stay plain text (workflow YAML, executable scripts,
+    //    crypto helpers) so GitHub Actions can read/execute them.
+    const PLAIN_TEXT_PATTERNS = [
+      /^\.github\/workflows\/.+\.ya?ml$/,      // GHA workflow definitions
+      /^loop-agent\/schedules\/.+\.(js|py)$/,   // scheduled task scripts
+      /^loop-agent\/schedules\/_crypto\.js$/,    // crypto helper
+      /^loop-agent\/schedules\/_callback\.js$/,  // callback helper
+    ];
+    function shouldSkipEncryption(filePath) {
+      return PLAIN_TEXT_PATTERNS.some(re => re.test(filePath));
+    }
     tools.push(tool(async ({ path, content, message }) => {
       try {
-        await repoStore.writeFile(path, content, message || `[loop-agent] Update ${path}`);
+        if (shouldSkipEncryption(path)) {
+          await repoStore.writeFileRaw(path, content, message || `[loop-agent] Update ${path}`);
+        } else {
+          await repoStore.writeFile(path, content, message || `[loop-agent] Update ${path}`);
+        }
         return `Successfully wrote ${content.length} chars to ${path}`;
       } catch (e) {
         return `Write failed: ${e.message}`;
       }
     }, {
       name: 'write_repo_file',
-      description: 'Write or update a file in the GitHub repository.',
+      description: 'Write or update a file in the GitHub repository. Workflow YAML files (.github/workflows/*.yml) and scheduled task scripts are always stored as plain text so GitHub Actions can execute them; all other files are encrypted if an encryption key is configured.',
       schema: z.object({
         path: z.string().describe('File path relative to repo root'),
         content: z.string().describe('File content to write'),
@@ -687,6 +911,713 @@ function createBuiltinTools(repoStore) {
     name: 'clawhub_skill_detail',
     description: 'Get detailed information about a specific ClawHub skill by slug. Inspect safety, author, stats before loading. Use load_skill to actually load a skill.',
     schema: z.object({ slug: z.string().describe('The skill slug, e.g. "email-daily-summary"') }),
+  }));
+
+  // 12. Screenshot Page — full-page screenshot using Playwright
+  tools.push(tool(async ({ url, waitFor }) => {
+    let browser;
+    try {
+      const { chromium } = require('playwright');
+      const path = require('path');
+      const fs = require('fs');
+
+      console.log(`[Screenshot] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`[Screenshot] URL: ${url}`);
+      console.log(`[Screenshot] Chromium available: ${chromium ? 'YES' : 'NO'}`);
+
+      const artifactDir = '/tmp/loop-agent-artifacts';
+      if (!fs.existsSync(artifactDir)) {
+        fs.mkdirSync(artifactDir, { recursive: true });
+        console.log(`[Screenshot] Created artifact dir`);
+      }
+
+      let chromiumPath;
+      try {
+        chromiumPath = chromium.executablePath();
+        console.log(`[Screenshot] Chromium executable: ${chromiumPath}`);
+        console.log(`[Screenshot] File exists: ${fs.existsSync(chromiumPath) ? 'YES' : 'NO'}`);
+      } catch (pathErr) {
+        console.warn(`[Screenshot] Warning: Could not determine chromium path - ${pathErr.message}`);
+      }
+
+      console.log(`[Screenshot] Launching browser...`);
+      const launchStart = Date.now();
+      browser = await chromium.launch({ headless: true });
+      console.log(`[Screenshot] Browser launched in ${Date.now() - launchStart}ms`);
+
+      console.log(`[Screenshot] Creating page (viewport: 1280x720)...`);
+      const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+      console.log(`[Screenshot] Navigating to ${url}...`);
+      const navStart = Date.now();
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+      console.log(`[Screenshot] Page loaded in ${Date.now() - navStart}ms`);
+
+      if (waitFor) {
+        const waitMs = Math.min(waitFor, 30000);
+        console.log(`[Screenshot] Waiting ${waitMs}ms for dynamic content...`);
+        await page.waitForTimeout(waitMs);
+      }
+
+      console.log(`[Screenshot] Measuring page dimensions...`);
+      const dimensions = await page.evaluate(() => ({
+        width: document.documentElement.scrollWidth,
+        height: document.documentElement.scrollHeight,
+      }));
+      console.log(`[Screenshot] Page size: ${dimensions.width}x${dimensions.height}px`);
+
+      // Validate dimensions for Telegram compatibility
+      if (dimensions.width < 1 || dimensions.height < 1) {
+        throw new Error(`Invalid page dimensions: ${dimensions.width}x${dimensions.height}`);
+      }
+
+      const timestamp = Date.now();
+      const domain = new URL(url).hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
+      const filename = `screenshot-${domain}-${timestamp}.png`;
+      const filepath = path.join(artifactDir, filename);
+
+      console.log(`[Screenshot] Taking full-page screenshot...`);
+      const shotStart = Date.now();
+      // fullPage: true captures entire scrollable content
+      // optimizeForSpeed: false for better quality
+      await page.screenshot({ 
+        path: filepath, 
+        fullPage: true,
+        type: 'png',
+        omitBackground: false,
+      });
+      console.log(`[Screenshot] Screenshot captured in ${Date.now() - shotStart}ms`);
+
+      await browser.close();
+      browser = null;
+
+      // Validate screenshot file
+      if (!fs.existsSync(filepath)) {
+        throw new Error(`Screenshot file not created: ${filepath}`);
+      }
+
+      const stats = fs.statSync(filepath);
+      const fileSize = Math.round(stats.size / 1024);
+      console.log(`[Screenshot] Saved: ${filename} (${fileSize}KB)`);
+
+      // Verify image integrity with Sharp before sending
+      const sharp = require('sharp');
+      let metadata;
+      try {
+        metadata = await sharp(filepath).metadata();
+        console.log(`[Screenshot] Image verified: ${metadata.width}x${metadata.height}px, format: ${metadata.format}`);
+        if (!metadata.width || !metadata.height || metadata.width < 1 || metadata.height < 1) {
+          throw new Error(`Invalid image dimensions: ${metadata.width}x${metadata.height}`);
+        }
+      } catch (metaErr) {
+        console.error(`[Screenshot] Image integrity check failed: ${metaErr.message}`);
+        throw new Error(`Screenshot validation failed: ${metaErr.message}`);
+      }
+
+      // Send screenshot to user via Telegram
+      const telegramResult = await sendTelegramPhoto(filepath, `📸 <b>${domain}</b>\n${url.slice(0, 80)}${url.length > 80 ? '...' : ''}`);
+      console.log(`[Screenshot] Telegram: ${telegramResult ? '✓ sent' : '✗ skipped'}`);
+
+      // Get brief AI summary using vision API
+      let summary = '';
+      try {
+        const sharp = require('sharp');
+        const metadata = await sharp(filepath).metadata();
+        const maxDim = 2048;
+        let imageBuffer;
+        if (metadata.width > maxDim || metadata.height > maxDim) {
+          imageBuffer = await sharp(filepath)
+            .resize(maxDim, maxDim, { fit: 'inside', withoutEnlargement: true })
+            .png().toBuffer();
+        } else {
+          imageBuffer = fs.readFileSync(filepath);
+        }
+        const base64Data = imageBuffer.toString('base64');
+        const provider = process.env.AI_PROVIDER || 'gemini';
+        const apiKey = process.env.AI_API_KEY;
+        const model = process.env.AI_MODEL || 'gemini-2.0-flash';
+        const summaryPrompt = 'Briefly describe the main content and layout of this web page screenshot in 2-3 sentences. Focus on what information the page presents and its key elements.';
+
+        console.log(`[Screenshot] Requesting AI summary from ${provider}/${model}...`);
+        if (provider === 'gemini') {
+          const resp = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{ parts: [
+                  { text: summaryPrompt },
+                  { inline_data: { mime_type: 'image/png', data: base64Data } },
+                ]}],
+              }),
+            }
+          );
+          if (resp.ok) {
+            const data = await resp.json();
+            summary = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+          }
+        } else {
+          const baseURLMap = {
+            qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+            kimi: 'https://api.moonshot.cn/v1',
+          };
+          const baseURL = baseURLMap[provider] || baseURLMap.qwen;
+          const visionModel = provider === 'qwen' ? 'qwen-vl-max' : model;
+          const resp = await fetch(`${baseURL}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: visionModel,
+              messages: [{
+                role: 'user',
+                content: [
+                  { type: 'text', text: summaryPrompt },
+                  { type: 'image_url', image_url: { url: `data:image/png;base64,${base64Data}` } },
+                ],
+              }],
+            }),
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            summary = data.choices?.[0]?.message?.content || '';
+          }
+        }
+        if (summary) console.log(`[Screenshot] Summary obtained (${summary.length} chars)`);
+      } catch (sumErr) {
+        console.warn(`[Screenshot] Summary failed: ${sumErr.message}`);
+      }
+
+      console.log(`[Screenshot] ✓ SUCCESS`);
+      console.log(`[Screenshot] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+      const parts = [`Screenshot of ${url} captured and sent to user via Telegram.`];
+      if (summary) parts.push(`\nPage summary:\n${summary}`);
+      parts.push(`\n[File: ${filepath}, ${fileSize}KB]`);
+      return parts.join('');
+    } catch (e) {
+      console.error(`[Screenshot] ❌ FAILED: ${e.message}`);
+      if (e.stack) console.error(`[Screenshot] ${e.stack.split('\n').slice(0, 3).join('\n')}`);
+      if (browser) try { await browser.close(); } catch { /* ignore */ }
+      return `Screenshot failed: ${e.message}`;
+    }
+  }, {
+    name: 'screenshot_page',
+    description: 'Take a full-page screenshot of a URL using Playwright. The image is automatically sent to the user via Telegram and a brief AI-generated summary is returned. Use when the user wants to see or check a web page.',
+    schema: z.object({
+      url: z.string().url().describe('The URL to screenshot'),
+      waitFor: z.number().optional().describe('Extra wait time in ms after page load for dynamic content (max 30000)'),
+    }),
+  }));
+
+  // 13. Analyze Page Visual — send screenshot to AI vision for analysis
+  tools.push(tool(async ({ imagePath, prompt: userPrompt }) => {
+    try {
+      const fs = require('fs');
+      const sharp = require('sharp');
+      if (!fs.existsSync(imagePath)) return `Image not found: ${imagePath}`;
+
+      // Read image and get original dimensions
+      const metadata = await sharp(imagePath).metadata();
+      const origW = metadata.width;
+      const origH = metadata.height;
+
+      // Resize for API if image is very large (max 4096px longest side)
+      const maxDim = 4096;
+      let imageBuffer;
+      let scale = 1;
+      if (origW > maxDim || origH > maxDim) {
+        const resized = await sharp(imagePath)
+          .resize(maxDim, maxDim, { fit: 'inside', withoutEnlargement: true })
+          .png()
+          .toBuffer();
+        imageBuffer = resized;
+        const longerSide = Math.max(origW, origH);
+        scale = longerSide / maxDim;
+        console.log(`[Vision] Resized from ${origW}x${origH} → scale factor ${scale.toFixed(2)}`);
+      } else {
+        imageBuffer = fs.readFileSync(imagePath);
+      }
+
+      const base64Data = imageBuffer.toString('base64');
+      const fileSizeKB = Math.round(imageBuffer.length / 1024);
+
+      const provider = process.env.AI_PROVIDER || 'gemini';
+      const apiKey = process.env.AI_API_KEY;
+      const model = process.env.AI_MODEL || 'gemini-2.0-flash';
+
+      const scaleNote = scale > 1
+        ? `\nIMPORTANT: The image was resized by a factor of ${scale.toFixed(2)} for analysis. The ORIGINAL image dimensions are ${origW}x${origH} pixels. All coordinates in your response MUST be in the ORIGINAL image coordinate space (multiply your visual coordinates by ${scale.toFixed(2)}).`
+        : `\nThe image dimensions are ${origW}x${origH} pixels. Provide coordinates in these dimensions.`;
+
+      const analysisPrompt = userPrompt || `Analyze this full-page screenshot of a web page. Your task:
+1. Describe the overall layout and structure of the page.
+2. Identify the MOST IMPORTANT content or element on the page (e.g. notifications, alerts, key headlines, call-to-action, critical data).
+3. Explain WHY this element is the most important.
+4. Provide the approximate bounding box coordinates of the important region in the ORIGINAL image pixel space.
+5. Summarize what the important content says or shows.
+${scaleNote}
+
+You MUST include the bounding box on its own line in this exact format:
+CROP_REGION: {"x": <left>, "y": <top>, "width": <width>, "height": <height>}`;
+
+      console.log(`[Vision] Sending ${fileSizeKB}KB image to ${provider}/${model}...`);
+      let responseText = '';
+
+      if (provider === 'gemini') {
+        const resp = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  { text: analysisPrompt },
+                  { inline_data: { mime_type: 'image/png', data: base64Data } },
+                ],
+              }],
+            }),
+          }
+        );
+        if (!resp.ok) {
+          const err = await resp.text();
+          return `Vision API error (${resp.status}): ${err.slice(0, 500)}`;
+        }
+        const data = await resp.json();
+        responseText = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '(no response)';
+      } else {
+        // OpenAI-compatible vision API (Qwen, Kimi, etc.)
+        const baseURLMap = {
+          qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+          kimi: 'https://api.moonshot.cn/v1',
+        };
+        const baseURL = baseURLMap[provider] || baseURLMap.qwen;
+        const visionModel = provider === 'qwen' ? 'qwen-vl-max' : model;
+
+        const resp = await fetch(`${baseURL}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: visionModel,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: analysisPrompt },
+                { type: 'image_url', image_url: { url: `data:image/png;base64,${base64Data}` } },
+              ],
+            }],
+          }),
+        });
+        if (!resp.ok) {
+          const err = await resp.text();
+          return `Vision API error (${resp.status}): ${err.slice(0, 500)}`;
+        }
+        const data = await resp.json();
+        responseText = data.choices?.[0]?.message?.content || '(no response)';
+      }
+
+      console.log(`[Vision] Analysis complete (${responseText.length} chars)`);
+      return `[Image: ${origW}x${origH}px, ${fileSizeKB}KB, scale=${scale.toFixed(2)}]\n\n${responseText}`;
+    } catch (e) {
+      return `Visual analysis failed: ${e.message}`;
+    }
+  }, {
+    name: 'analyze_page_visual',
+    description: 'Send a screenshot to the AI vision model for visual layout analysis. The AI identifies the most important content on the page and returns crop coordinates (CROP_REGION) for the key region. Use after screenshot_page. Returns analysis text with bounding box coordinates.',
+    schema: z.object({
+      imagePath: z.string().describe('Absolute path to the screenshot image file (from screenshot_page output)'),
+      prompt: z.string().optional().describe('Custom analysis prompt (default: identify most important region with crop coordinates)'),
+    }),
+  }));
+
+  // 14. Crop Image — crop a region from an image using sharp
+  tools.push(tool(async ({ imagePath, x, y, width, height }) => {
+    try {
+      const sharp = require('sharp');
+      const path = require('path');
+      const fs = require('fs');
+
+      if (!fs.existsSync(imagePath)) return `Image not found: ${imagePath}`;
+
+      const imgMeta = await sharp(imagePath).metadata();
+
+      // Clamp coordinates to image bounds
+      const cropX = Math.max(0, Math.round(Math.min(x, imgMeta.width - 1)));
+      const cropY = Math.max(0, Math.round(Math.min(y, imgMeta.height - 1)));
+      const cropW = Math.max(1, Math.round(Math.min(width, imgMeta.width - cropX)));
+      const cropH = Math.max(1, Math.round(Math.min(height, imgMeta.height - cropY)));
+
+      const artifactDir = '/tmp/loop-agent-artifacts';
+      if (!fs.existsSync(artifactDir)) fs.mkdirSync(artifactDir, { recursive: true });
+
+      const basename = path.basename(imagePath, path.extname(imagePath));
+      const outputFilename = `${basename}-crop-${cropX}_${cropY}_${cropW}x${cropH}.png`;
+      const outputPath = path.join(artifactDir, outputFilename);
+
+      await sharp(imagePath)
+        .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+        .toFile(outputPath);
+
+      const stats = fs.statSync(outputPath);
+      console.log(`[Crop] Saved ${outputFilename} (${Math.round(stats.size / 1024)}KB, ${cropW}x${cropH})`);
+
+      // Send cropped image to user via Telegram
+      await sendTelegramPhoto(outputPath, `🔍 Cropped region (${cropW}x${cropH})`);
+
+      return JSON.stringify({
+        success: true,
+        path: outputPath,
+        filename: outputFilename,
+        region: { x: cropX, y: cropY, width: cropW, height: cropH },
+        fileSize: stats.size,
+      });
+    } catch (e) {
+      return `Crop failed: ${e.message}`;
+    }
+  }, {
+    name: 'crop_image',
+    description: 'Crop a rectangular region from an image and send it to the user via Telegram. Use coordinates from analyze_page_visual CROP_REGION output. Coordinates are clamped to image bounds.',
+    schema: z.object({
+      imagePath: z.string().describe('Absolute path to the source image'),
+      x: z.number().describe('Left edge X coordinate in pixels'),
+      y: z.number().describe('Top edge Y coordinate in pixels'),
+      width: z.number().describe('Width of the crop region in pixels'),
+      height: z.number().describe('Height of the crop region in pixels'),
+    }),
+  }));
+
+  // ── create_scheduled_task: Create a cron-scheduled GHA workflow ────
+  tools.push(tool(async ({ name, description, cron, script, language }) => {
+    if (!repoStore) return 'Error: GitHub repo not configured, cannot create scheduled tasks.';
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'task';
+    const workflowFile = `scheduled-${slug}.yml`;
+    const workflowPath = `.github/workflows/${workflowFile}`;
+    const taskRecordPath = `loop-agent/schedules/${slug}.json`;
+    const lang = (language || 'node').toLowerCase();
+    const setupStep = lang === 'python'
+      ? '      - uses: actions/setup-python@v5\n        with:\n          python-version: "3.12"\n      - run: pip install -r requirements.txt 2>/dev/null || true'
+      : '';
+    const runCmd = lang === 'python' ? `python loop-agent/schedules/${slug}.py` : `node loop-agent/schedules/${slug}.js`;
+    const scriptPath = `loop-agent/schedules/${slug}.${lang === 'python' ? 'py' : 'js'}`;
+    const cryptoHelperPath = 'loop-agent/schedules/_crypto.js';
+    const callbackHelperPath = 'loop-agent/schedules/_callback.js';
+
+    // Build the workflow YAML
+    // NOTE: Workflow YAML and script files are NEVER encrypted — they must be
+    // readable by GitHub Actions.  Sensitive user data (prompts, memory, etc.)
+    // stays encrypted in the repo; scripts decrypt them at runtime via
+    // LOOP_ENCRYPT_KEY and the _crypto.js helper.
+    const yaml = [
+      `# scheduled-task: ${slug}`,
+      `name: "Scheduled — ${name}"`,
+      '',
+      'on:',
+      '  schedule:',
+      `    - cron: '${cron}'`,
+      '  workflow_dispatch: {}',
+      '',
+      'jobs:',
+      '  run-and-notify:',
+      '    runs-on: ubuntu-latest',
+      '    steps:',
+      '      - uses: actions/checkout@v4',
+      setupStep,
+      `      - name: Run task`,
+      '        id: run-task',
+      '        env:',
+      '          LOOP_ENCRYPT_KEY: ${{ secrets.LOOP_ENCRYPT_KEY }}',
+      '        run: |',
+      `          ${runCmd} > /tmp/_task_output.txt 2>&1 || true`,
+      '          echo "output<<EOF" >> $GITHUB_OUTPUT',
+      '          head -c 3000 /tmp/_task_output.txt >> $GITHUB_OUTPUT',
+      '          echo "EOF" >> $GITHUB_OUTPUT',
+      '',
+      '      - name: Callback to Loop Agent',
+      '        if: always()',
+      '        env:',
+      '          UPSTASH_URL: ${{ secrets.UPSTASH_URL }}',
+      '          UPSTASH_TOKEN: ${{ secrets.UPSTASH_TOKEN }}',
+      '          LOOP_KEY: ${{ secrets.LOOP_KEY }}',
+      '          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}',
+      '          GITHUB_REPOSITORY: ${{ github.repository }}',
+      '        run: |',
+      `          OUTPUT=$(head -c 2000 /tmp/_task_output.txt 2>/dev/null || echo "(no output)")`,
+      `          node loop-agent/schedules/_callback.js "[Scheduled] ${name.replace(/"/g, '\\"')}" "$OUTPUT"`,
+      '',
+      '      - name: Notify',
+      '        if: always()',
+      '        env:',
+      '          PUSHOO_CHANNELS: ${{ secrets.PUSHOO_CHANNELS }}',
+      '        run: |',
+      '          npm install pushoo 2>/dev/null',
+      `          node -e "const p=require('pushoo').default;const ch=JSON.parse(process.env.PUSHOO_CHANNELS||'[]');const o=require('fs').readFileSync('/tmp/_task_output.txt','utf8').slice(0,2000);ch.forEach(c=>p(c.platform,{token:c.token,title:'[Scheduled] ${name.replace(/'/g, "\\'")}',content:o||'(no output)'}).catch(e=>console.warn(e.message)))"`,
+    ].filter(Boolean).join('\n') + '\n';
+
+    // Crypto helper — small CommonJS module that scheduled scripts can
+    // require('./_crypto') to decrypt encrypted repo files at runtime.
+    const cryptoHelperCode = [
+      '// _crypto.js — Decryption helper for scheduled tasks',
+      '// Usage: const { readEncryptedFile } = require("./_crypto");',
+      '//        const data = readEncryptedFile("../../loop-agent/MEMORY.md");',
+      'const crypto = require("crypto");',
+      'const fs = require("fs");',
+      'const PREFIX = "ENCRYPTED:";',
+      'function decrypt(passphrase, blob) {',
+      '  if (!blob || !blob.startsWith(PREFIX)) return blob;',
+      '  const packed = Buffer.from(blob.slice(PREFIX.length), "base64");',
+      '  const salt = packed.subarray(0, 16);',
+      '  const iv = packed.subarray(16, 28);',
+      '  const rest = packed.subarray(28);',
+      '  const tag = rest.subarray(rest.length - 16);',
+      '  const ct = rest.subarray(0, rest.length - 16);',
+      '  const key = crypto.pbkdf2Sync(passphrase, salt, 310000, 32, "sha256");',
+      '  const d = crypto.createDecipheriv("aes-256-gcm", key, iv);',
+      '  d.setAuthTag(tag);',
+      '  return d.update(ct, undefined, "utf8") + d.final("utf8");',
+      '}',
+      'function readEncryptedFile(filePath) {',
+      '  const k = process.env.LOOP_ENCRYPT_KEY;',
+      '  const c = fs.readFileSync(filePath, "utf8");',
+      '  return (k && c.startsWith(PREFIX)) ? decrypt(k, c) : c;',
+      '}',
+      'module.exports = { decrypt, readEncryptedFile, PREFIX };',
+    ].join('\n') + '\n';
+
+    // Callback helper — allows scheduled tasks to send messages to the
+    // running loop agent via Upstash (preferred) or repo file channel.
+    // The loop agent picks these up through its normal polling loop.
+    const callbackHelperCode = [
+      '// _callback.js — Communication helper for scheduled tasks',
+      '// Sends task output to the loop agent inbox so the running agent can react.',
+      '// Supports two backends: Upstash Redis (preferred) and GitHub repo file.',
+      '// Usage: node _callback.js "title" "body"',
+      '//   or:  const { sendToAgent, pollAgentReply } = require("./_callback");',
+      'const https = require("https");',
+      'const http = require("http");',
+      '',
+      'function request(url, opts, body) {',
+      '  return new Promise((resolve, reject) => {',
+      '    const mod = url.startsWith("https") ? https : http;',
+      '    const req = mod.request(url, opts, (res) => {',
+      '      let data = "";',
+      '      res.on("data", (d) => data += d);',
+      '      res.on("end", () => resolve({ status: res.statusCode, body: data }));',
+      '    });',
+      '    req.on("error", reject);',
+      '    if (body) req.write(body);',
+      '    req.end();',
+      '  });',
+      '}',
+      '',
+      'function makeMessage(text) {',
+      '  return JSON.stringify({ ts: Date.now(), from: "scheduled-task", text, extra: {}, read: false });',
+      '}',
+      '',
+      'async function upstashCmd(url, token, cmd) {',
+      '  const resp = await request(url, {',
+      '    method: "POST",',
+      '    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },',
+      '  }, JSON.stringify(cmd));',
+      '  return JSON.parse(resp.body);',
+      '}',
+      '',
+      'async function ghRead(token, repo, path) {',
+      '  const url = `https://api.github.com/repos/${repo}/contents/${path}?ref=main`;',
+      '  const resp = await request(url, {',
+      '    method: "GET",',
+      '    headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github.v3+json", "User-Agent": "loop-agent-callback" },',
+      '  });',
+      '  if (resp.status === 404) return null;',
+      '  const data = JSON.parse(resp.body);',
+      '  return { content: Buffer.from(data.content, "base64").toString("utf-8"), sha: data.sha };',
+      '}',
+      '',
+      'async function ghWrite(token, repo, path, content, message, sha) {',
+      '  const url = `https://api.github.com/repos/${repo}/contents/${path}`;',
+      '  const body = { message, content: Buffer.from(content).toString("base64"), branch: "main" };',
+      '  if (sha) body.sha = sha;',
+      '  return request(url, {',
+      '    method: "PUT",',
+      '    headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github.v3+json", "Content-Type": "application/json", "User-Agent": "loop-agent-callback" },',
+      '  }, JSON.stringify(body));',
+      '}',
+      '',
+      'async function sendToAgent(text, opts = {}) {',
+      '  const upstashUrl = process.env.UPSTASH_URL;',
+      '  const upstashToken = process.env.UPSTASH_TOKEN;',
+      '  const loopKey = process.env.LOOP_KEY;',
+      '  const ghToken = process.env.GITHUB_TOKEN;',
+      '  const repo = process.env.GITHUB_REPOSITORY;',
+      '  const msg = makeMessage(text);',
+      '',
+      '  if (upstashUrl && upstashToken && loopKey) {',
+      '    const key = `loop:${loopKey}:inbox`;',
+      '    await upstashCmd(upstashUrl, upstashToken, ["SET", key, msg]);',
+      '    console.log("[callback] Sent to Upstash inbox:", key);',
+      '    return "upstash";',
+      '  }',
+      '  if (ghToken && repo && loopKey) {',
+      '    const path = `loop-agent/channel/${loopKey}.inbox.json`;',
+      '    const existing = await ghRead(ghToken, repo, path);',
+      '    await ghWrite(ghToken, repo, path, msg, "[scheduled-task] Callback", existing ? existing.sha : undefined);',
+      '    console.log("[callback] Sent to repo inbox:", path);',
+      '    return "repo";',
+      '  }',
+      '  console.warn("[callback] No Upstash or GitHub channel configured; skipping.");',
+      '  return null;',
+      '}',
+      '',
+      'async function pollAgentReply(timeoutMs = 120000, intervalMs = 10000) {',
+      '  const upstashUrl = process.env.UPSTASH_URL;',
+      '  const upstashToken = process.env.UPSTASH_TOKEN;',
+      '  const loopKey = process.env.LOOP_KEY;',
+      '  const ghToken = process.env.GITHUB_TOKEN;',
+      '  const repo = process.env.GITHUB_REPOSITORY;',
+      '  const deadline = Date.now() + timeoutMs;',
+      '',
+      '  while (Date.now() < deadline) {',
+      '    try {',
+      '      let raw = null;',
+      '      if (upstashUrl && upstashToken && loopKey) {',
+      '        const key = `loop:${loopKey}:outbox`;',
+      '        const resp = await upstashCmd(upstashUrl, upstashToken, ["GET", key]);',
+      '        raw = resp.result;',
+      '      } else if (ghToken && repo && loopKey) {',
+      '        const path = `loop-agent/channel/${loopKey}.outbox.json`;',
+      '        const file = await ghRead(ghToken, repo, path);',
+      '        if (file) raw = file.content;',
+      '      }',
+      '      if (raw) {',
+      '        const msg = typeof raw === "string" ? JSON.parse(raw) : raw;',
+      '        if (msg && msg.text && !msg.read) {',
+      '          console.log("[callback] Agent replied:", msg.text.slice(0, 200));',
+      '          return msg;',
+      '        }',
+      '      }',
+      '    } catch (e) { console.warn("[callback] Poll error:", e.message); }',
+      '    await new Promise(r => setTimeout(r, intervalMs));',
+      '  }',
+      '  console.log("[callback] No reply within timeout.");',
+      '  return null;',
+      '}',
+      '',
+      '// CLI mode: node _callback.js "title" "body"',
+      'if (require.main === module) {',
+      '  const title = process.argv[2] || "Scheduled Task";',
+      '  const body = process.argv[3] || "";',
+      '  sendToAgent(`${title}\\n${body}`).then(ch => {',
+      '    console.log("[callback] Done via", ch || "none");',
+      '  }).catch(e => {',
+      '    console.error("[callback] Error:", e.message);',
+      '    process.exit(1);',
+      '  });',
+      '}',
+      '',
+      'module.exports = { sendToAgent, pollAgentReply, makeMessage };',
+    ].join('\n') + '\n';
+
+    try {
+      // Write executable files WITHOUT encryption — GHA must be able to read them
+      await repoStore.writeFileRaw(scriptPath, script, `[scheduled] Add script for ${name}`);
+      await repoStore.writeFileRaw(workflowPath, yaml, `[scheduled] Create schedule for ${name}`);
+
+      // Write shared crypto helper (plain text) so scripts can decrypt user data
+      if (repoStore._encryptKey) {
+        await repoStore.writeFileRaw(cryptoHelperPath, cryptoHelperCode, '[scheduled] Add/update crypto helper');
+      }
+
+      // Write callback helper (plain text) for scheduled task → loop agent communication
+      await repoStore.writeFileRaw(callbackHelperPath, callbackHelperCode, '[scheduled] Add/update callback helper');
+
+      // Create/update task record
+      let record = { name, slug, description, cron, language: lang, createdAt: new Date().toISOString(), executions: [] };
+      try {
+        const existing = await repoStore.readFile(taskRecordPath);
+        if (existing) record = JSON.parse(existing.content);
+      } catch { /* new record */ }
+      record.cron = cron;
+      record.description = description;
+      record.updatedAt = new Date().toISOString();
+      await repoStore.writeFile(taskRecordPath, JSON.stringify(record, null, 2), `[scheduled] Update record for ${name}`);
+
+      // Immediately trigger the workflow via workflow_dispatch so the user
+      // doesn't have to wait for the next cron tick.
+      let triggerMsg = '';
+      try {
+        const dispatchResp = await fetch(
+          `${repoStore.api}/repos/${repoStore.owner}/${repoStore.repo}/actions/workflows/${workflowFile}/dispatches`,
+          {
+            method: 'POST',
+            headers: repoStore._headers(),
+            body: JSON.stringify({ ref: 'main' }),
+          }
+        );
+        if (dispatchResp.status === 204 || dispatchResp.ok) {
+          triggerMsg = '\n\n✅ The workflow has been triggered immediately for its first run.';
+        } else {
+          triggerMsg = `\n\n⚠️ Auto-trigger returned HTTP ${dispatchResp.status}. You can trigger it manually via workflow_dispatch.`;
+        }
+      } catch (triggerErr) {
+        triggerMsg = `\n\n⚠️ Auto-trigger failed: ${triggerErr.message}. You can trigger it manually via workflow_dispatch.`;
+      }
+
+      return `Scheduled task "${name}" created successfully.\n- Cron: ${cron}\n- Workflow: ${workflowPath}\n- Script: ${scriptPath}\n- Record: ${taskRecordPath}${triggerMsg}`;
+    } catch (e) {
+      return `Failed to create scheduled task: ${e.message}`;
+    }
+  }, {
+    name: 'create_scheduled_task',
+    description: 'Create a scheduled task for the loop agent to execute periodically on a cron schedule. The script will run in GitHub Actions, and its output is automatically sent to the loop agent\'s inbox, which then notifies the user via configured channels (Telegram, email, etc.). Do NOT include notification code in the script—the callback system handles delivery automatically. Use this to set up recurring agent tasks like periodic data fetches, reports, or monitoring.',
+    schema: z.object({
+      name: z.string().describe('Human-readable task name (e.g. "Daily Weather Report")'),
+      description: z.string().describe('Brief description of what this task does'),
+      cron: z.string().describe('Cron expression in 5-field format (e.g. "0 9 * * *" for daily at 9:00 UTC)'),
+      script: z.string().describe('The complete script code to run on each execution'),
+      language: z.enum(['node', 'python']).describe('Script language: "node" or "python"'),
+    }),
+  }));
+
+  // ── list_scheduled_tasks: List all scheduled task records ──────────
+  tools.push(tool(async () => {
+    if (!repoStore) return 'Error: GitHub repo not configured.';
+    try {
+      // List files in loop-agent/schedules/ directory
+      const resp = await fetch(
+        `${repoStore.api}/repos/${repoStore.owner}/${repoStore.repo}/contents/loop-agent/schedules?ref=main`,
+        { headers: repoStore._headers() }
+      );
+      if (resp.status === 404) return 'No scheduled tasks found.';
+      if (!resp.ok) return `Failed to list tasks: HTTP ${resp.status}`;
+      const files = await resp.json();
+      const records = files.filter(f => f.name.endsWith('.json'));
+      if (records.length === 0) return 'No scheduled task records found.';
+
+      const tasks = [];
+      for (const rec of records) {
+        try {
+          const data = await repoStore.readFile(`loop-agent/schedules/${rec.name}`);
+          if (data) {
+            const task = JSON.parse(data.content);
+            const lastExec = task.executions?.length > 0 ? task.executions[task.executions.length - 1] : null;
+            tasks.push(`- **${task.name}** (cron: \`${task.cron}\`)\n  ${task.description || ''}\n  Last run: ${lastExec ? lastExec.timestamp + ' — ' + (lastExec.summary || 'no summary') : 'never'}`);
+          }
+        } catch { /* skip corrupted records */ }
+      }
+      return tasks.length > 0 ? `## Scheduled Tasks\n\n${tasks.join('\n\n')}` : 'No valid task records found.';
+    } catch (e) {
+      return `Failed to list tasks: ${e.message}`;
+    }
+  }, {
+    name: 'list_scheduled_tasks',
+    description: 'List all scheduled tasks created by this agent, showing their cron schedule, description, and last execution summary.',
+    schema: z.object({}),
   }));
 
   return tools;
@@ -961,6 +1892,18 @@ Available tools:
 - search_skills: Unified search across built-in skill catalog AND ClawHub community registry. Use when current tools cannot complete a task.
 - load_skill: Load a skill by URL, built-in name, or ClawHub slug. Skills are activated automatically via the skill router.
 - clawhub_skill_detail: Inspect a ClawHub skill's safety, author, and changelog before loading.
+- screenshot_page: Take a full-page screenshot of a URL, automatically send it to the user via Telegram, and return a brief AI-generated summary.
+- analyze_page_visual: Send a screenshot to the AI vision model for detailed layout analysis. Returns crop coordinates for important regions.
+- crop_image: Crop a region from an image and send it to the user via Telegram.
+
+PAGE SCREENSHOT (when user asks to screenshot or view a URL):
+1. screenshot_page — captures the full page, sends image to user via Telegram, returns a brief summary
+Include the summary in your response. The image is already delivered.
+
+DEEP VISUAL ANALYSIS (when user asks for detailed analysis of a page):
+1. screenshot_page — capture and send the screenshot
+2. analyze_page_visual — detailed region identification with CROP_REGION coordinates
+3. crop_image — crop important regions (auto-sent to user via Telegram)
 
 SKILL SYSTEM:
 You can extend your capabilities by loading skills. Skills are managed by a router that prevents conflicts.
@@ -970,6 +1913,8 @@ You can extend your capabilities by loading skills. Skills are managed by a rout
 - clawhub_skill_detail lets you inspect a skill before loading it.
 - NEVER refuse a task without first searching for available skills.
 - Skills are isolated: each skill only applies to its relevant domain.
+- create_scheduled_task creates cron-scheduled GitHub Actions workflows for recurring tasks.
+- list_scheduled_tasks shows all scheduled tasks and their last execution status.
 
 CRITICAL RULES:
 1. ALWAYS use your tools to take action. NEVER output code blocks as text — USE the tools directly.
@@ -1954,651 +2899,758 @@ async function processUserMessage(text, { agentGraph, graphState, history, repoS
   return { responseText };
 }
 
+// ─── Unified Mode Lifecycle Management ──────────────────────────────
+//
+// Architecture: One always-running browser polling loop + optional
+// stoppable bidirectional listener (Telegram OR WeCom).
+//
+// When __SWITCH_CHANNEL__ is received:
+// 1. Stop current listener (kill Telegram bot / disconnect WeCom WebSocket)
+// 2. Update pushooChannels
+// 3. Start new listener for the target channel (if bidirectional)
+// 4. Browser polling continues uninterrupted throughout
+//
+// This enables true runtime switching between communication modes.
+
+const _runtime = {
+  listener: null,        // { type: 'telegram'|'wecom', stop(), sendMsg(text) } or null
+  pollTimer: null,       // browser polling setTimeout handle
+  processing: false,     // global mutex for concurrent message processing
+  processedCount: 0,     // total messages processed
+  startTime: 0,          // process start timestamp
+  dormant: false,        // dormant mode (Upstash-inherited, ignores regular messages)
+};
+
+// ─── Stoppable Telegram Listener ────────────────────────────────────
+
 /**
- * Run in Telegram mode: use Telegraf long-polling for message I/O.
- * The bot receives messages from the user via Telegram and replies directly.
+ * Create and start a Telegram bot listener.
+ * The bot runs as a background polling process (Telegraf).
+ * Returns { type, stop(), sendMsg(text) } — call stop() to kill the bot.
  */
-async function runTelegramMode({
-  botToken, chatId, agentGraph, graphState, history, repoStore, upstash, loopKey, historyPath,
-  maxRuntime, pollInterval, aiProvider, aiModel,
-}) {
+async function createTelegramListener(ctx) {
+  console.log(`[Telegram] createTelegramListener() called`);
+  console.log(`[Telegram] pushooChannels: ${JSON.stringify(ctx.pushooChannels.map(c => ({ platform: c.platform, hasToken: !!c.token })))}`);
+  const channel = ctx.pushooChannels.find(ch => ch.platform === 'telegram');
+  if (!channel) {
+    console.warn(`[Telegram] No telegram channel found in pushooChannels — returning null`);
+    return null;
+  }
+  console.log(`[Telegram] Found telegram channel, token length: ${channel.token ? channel.token.length : 0}`);
+
+  const { botToken, chatId } = parseTelegramToken(channel.token);
+  if (!botToken) {
+    console.warn(`[Telegram] parseTelegramToken returned empty botToken — returning null`);
+    console.warn(`[Telegram] Raw token (first 20 chars): ${channel.token ? channel.token.slice(0, 20) + '...' : '(empty)'}`);
+    return null;
+  }
+  console.log(`[Telegram] botToken length: ${botToken.length}, chatId: ${chatId || '(empty)'}`);
+
   const { Telegraf } = require('telegraf');
   const bot = new Telegraf(botToken);
-  const startTime = Date.now();
-  let processedCount = 0;
-  let processing = false;
+  let stopped = false;
 
-  console.log(`[Telegram] Starting Telegraf polling mode...`);
-  console.log(`[Telegram] Authorized chat ID: ${chatId || '(any)'}`);
+  console.log(`[Telegram] Starting listener...`);
+  console.log(`[Telegram] Chat ID: ${chatId || '(any)'}`);
 
-  // Helper to update status in Upstash (optional)
+  // /start
+  bot.command('start', async (bctx) => {
+    await bctx.reply(
+      `🤖 Loop Agent active.\nModel: ${ctx.aiProvider}/${ctx.aiModel}\nSend a message to start.`
+    );
+  });
+
+  // /status
+  bot.command('status', async (bctx) => {
+    const elapsed = Math.round((Date.now() - _runtime.startTime) / 60000);
+    const remaining = Math.max(0, Math.round((ctx.maxRuntime - (Date.now() - _runtime.startTime)) / 60000));
+    await bctx.reply(
+      `📊 Loop Agent Status\n` +
+      `Runtime: ${elapsed} min\n` +
+      `Processed: ${_runtime.processedCount} messages\n` +
+      `Remaining: ~${remaining} min\n` +
+      `Model: ${ctx.aiProvider}/${ctx.aiModel}\n` +
+      `Processing: ${_runtime.processing ? 'yes' : 'idle'}`
+    );
+  });
+
+  // /stop
+  bot.command('stop', async (bctx) => {
+    await bctx.reply('👋 Loop Agent stopping...');
+    process.exit(0);
+  });
+
+  // Text messages → process with agent graph
+  bot.on('text', async (bctx) => {
+    const msg = bctx.message;
+    if (chatId && String(msg.chat.id) !== String(chatId)) return;
+    const text = msg.text;
+    if (!text || /^\/(start|status|stop)\b/i.test(text)) return;
+
+    if (_runtime.processing) {
+      await bctx.reply('⏳ Still processing the previous message, please wait...');
+      return;
+    }
+
+    _runtime.processing = true;
+    console.log(`[Telegram] Received message (${text.length} chars)`);
+
+    try {
+      await bctx.sendChatAction('typing');
+      const { responseText } = await processUserMessage(text, {
+        agentGraph: ctx.agentGraph, graphState: ctx.graphState,
+        history: ctx.history, repoStore: ctx.repoStore,
+        loopKey: ctx.loopKey, historyPath: ctx.historyPath,
+      });
+
+      const chunks = splitTelegramMessage(responseText);
+      for (const chunk of chunks) {
+        await bctx.reply(chunk);
+      }
+      _runtime.processedCount++;
+      console.log(`[Telegram] Replied (${responseText.length} chars), total: ${_runtime.processedCount}`);
+    } catch (err) {
+      console.error(`[Telegram] Processing error: ${err.message}`);
+      try { await bctx.reply(`❌ Error: ${err.message}`); } catch { /* best effort */ }
+    } finally {
+      _runtime.processing = false;
+    }
+  });
+
+  bot.catch((err) => console.error(`[Telegram] Bot error: ${err.message}`));
+
+  // Clear any existing webhook/polling state before launching
+  try {
+    console.log(`[Telegram] Clearing webhook and pending updates...`);
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log(`[Telegram] Webhook cleared.`);
+  } catch (e) {
+    console.warn(`[Telegram] Webhook clear failed (non-fatal): ${e.message}`);
+  }
+
+  // Launch polling — IMPORTANT: bot.launch() returns a promise that resolves when
+  // polling STOPS (not starts). Telegraf's Polling.loop() is an infinite for-await
+  // loop. We must NOT await it, or createTelegramListener() would block forever
+  // and browser polling would never start (preventing __SWITCH_CHANNEL__ etc).
+  console.log(`[Telegram] Launching polling (fire-and-forget)...`);
+  const launchStart = Date.now();
+  bot.launch({
+    dropPendingUpdates: true,
+    allowedUpdates: ['message'],
+  }).then(() => {
+    // This resolves when bot.stop() is called
+    console.log(`[Telegram] Polling loop ended normally.`);
+  }).catch((launchErr) => {
+    if (stopped) {
+      console.log(`[Telegram] Polling ended after stop: ${launchErr.message}`);
+    } else {
+      console.error(`[Telegram] ❌ Bot polling error: ${launchErr.message}`);
+      console.error(`[Telegram] This usually means another bot instance is already polling.`);
+      console.error(`[Telegram] Stack: ${launchErr.stack}`);
+    }
+  });
+
+  // Wait for bot.botInfo to be set (getMe completes) and first getUpdates to fire
+  // This confirms the bot is actually polling, without blocking forever
+  const readyTimeout = 15000;
+  const readyStart = Date.now();
+  while (!bot.botInfo && Date.now() - readyStart < readyTimeout) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+  if (bot.botInfo) {
+    console.log(`[Telegram] ✅ Bot polling started (@${bot.botInfo.username}, ${Date.now() - launchStart}ms).`);
+  } else {
+    console.error(`[Telegram] ⚠ Bot info not available after ${readyTimeout}ms — polling may have failed`);
+    return null;
+  }
+
+  return {
+    type: 'telegram',
+    async stop() {
+      if (stopped) return;
+      stopped = true;
+      console.log(`[Telegram] Stopping bot (reason: SWITCH_CHANNEL)...`);
+      try {
+        bot.stop('SWITCH_CHANNEL');
+        // Wait for Telegraf to complete in-flight getUpdates abort
+        await new Promise(r => setTimeout(r, 500));
+        console.log(`[Telegram] Bot polling abort completed.`);
+      } catch (e) {
+        console.warn(`[Telegram] Error during stop: ${e.message}`);
+      }
+      console.log(`[Telegram] Bot stopped.`);
+    },
+    async sendMsg(text) {
+      if (!chatId || stopped) return;
+      try {
+        const chunks = splitTelegramMessage(`📩 [Browser]\n${text}`);
+        for (const chunk of chunks) {
+          await bot.telegram.sendMessage(chatId, chunk);
+        }
+      } catch (e) { console.warn(`[Telegram] Forward failed: ${e.message}`); }
+    },
+  };
+}
+
+// ─── Stoppable WeCom Listener ───────────────────────────────────────
+
+/**
+ * Create and start a WeCom bot listener via WebSocket.
+ * Returns { type, stop(), sendMsg(text) } — call stop() to disconnect.
+ */
+async function createWecomListener(ctx) {
+  console.log(`[WeCom] createWecomListener() called`);
+  console.log(`[WeCom] pushooChannels: ${JSON.stringify(ctx.pushooChannels.map(c => ({ platform: c.platform, hasToken: !!c.token })))}`);
+  const channel = ctx.pushooChannels.find(ch => ch.platform === 'wecombot');
+  if (!channel) {
+    console.warn(`[WeCom] No wecombot channel found in pushooChannels — returning null`);
+    return null;
+  }
+  console.log(`[WeCom] Found wecombot channel, token length: ${channel.token ? channel.token.length : 0}`);
+
+  const rawToken = channel.token || '';
+  const [wecomBotId, wecomSecret] = rawToken.split('#');
+  if (!wecomBotId || !wecomSecret) {
+    console.warn(`[WeCom] Token parse failed — expected 'botId#secret' format`);
+    console.warn(`[WeCom] Raw token (first 30 chars): ${rawToken.slice(0, 30)}...`);
+    console.warn(`[WeCom] Parsed botId: '${wecomBotId || ''}' (${wecomBotId ? wecomBotId.length : 0} chars)`);
+    console.warn(`[WeCom] Parsed secret: '${wecomSecret ? wecomSecret.slice(0, 5) + '...' : ''}' (${wecomSecret ? wecomSecret.length : 0} chars)`);
+    return null;
+  }
+
+  console.log(`[WeCom] Token parsed: botId=${wecomBotId.slice(0, 12)}** (${wecomBotId.length} chars), secret=${wecomSecret.slice(0, 5)}** (${wecomSecret.length} chars)`);
+
+  let AiBot, generateReqId;
+  try {
+    AiBot = require('@wecom/aibot-node-sdk').default;
+    generateReqId = require('@wecom/aibot-node-sdk').generateReqId;
+    console.log(`[WeCom] @wecom/aibot-node-sdk loaded successfully`);
+  } catch (loadErr) {
+    console.error(`[WeCom] ❌ Failed to load @wecom/aibot-node-sdk: ${loadErr.message}`);
+    return null;
+  }
+  let stopped = false;
+
+  console.log(`[WeCom] Starting WebSocket listener...`);
+  console.log(`[WeCom] Bot ID: ${wecomBotId.slice(0, 8)}...`);
+
+  const wsClient = new AiBot.WSClient({
+    botId: wecomBotId,
+    secret: wecomSecret,
+    maxReconnectAttempts: -1, // infinite reconnect in GHA
+  });
+
+  // Connect and wait for initial connection
+  const connectPromise = new Promise((resolve, reject) => {
+    const connectTimeout = setTimeout(() => {
+      console.warn(`[WeCom] Connection timeout (10s) — proceeding anyway`);
+      resolve('timeout');
+    }, 10000);
+
+    wsClient.on('connected', () => {
+      clearTimeout(connectTimeout);
+      console.log(`[WeCom] WebSocket connected`);
+    });
+
+    wsClient.on('authenticated', () => {
+      clearTimeout(connectTimeout);
+      console.log(`[WeCom] Authenticated — listener ready`);
+      resolve('authenticated');
+    });
+
+    wsClient.on('error', (err) => {
+      console.error(`[WeCom] Connection error: ${err.message}`);
+      // Don't reject — let it retry
+    });
+  });
+
+  wsClient.on('disconnected', (reason) => console.log(`[WeCom] Disconnected: ${reason}`));
+  wsClient.on('reconnecting', (attempt) => console.log(`[WeCom] Reconnecting (attempt ${attempt})...`));
+
+  // Welcome on chat enter
+  wsClient.on('event.enter_chat', async (frame) => {
+    try {
+      wsClient.sendReply(frame, {
+        msgtype: 'text',
+        text: { content: `🤖 Loop Agent active. Model: ${ctx.aiProvider}/${ctx.aiModel}\nSend a message to start.` },
+        reqid: generateReqId(),
+      });
+    } catch { /* best effort */ }
+  });
+
+  // Text messages → process with agent graph
+  wsClient.on('message.text', async (frame) => {
+    const body = frame.body;
+    const content = body.text?.content || '';
+    const from = body.from?.userid || 'unknown';
+    if (!content) return;
+
+    console.log(`[WeCom] Received message from ${from} (${content.length} chars)`);
+
+    // /status
+    if (/^\/status\b/i.test(content)) {
+      const elapsed = Math.round((Date.now() - _runtime.startTime) / 60000);
+      const remaining = Math.round((ctx.maxRuntime - (Date.now() - _runtime.startTime)) / 60000);
+      const statusText = `📊 Agent Status\nProcessed: ${_runtime.processedCount} messages\nRunning: ${elapsed} min\nRemaining: ~${remaining} min\nModel: ${ctx.aiProvider}/${ctx.aiModel}\nProcessing: ${_runtime.processing ? 'yes' : 'idle'}`;
+      try {
+        const streamId = generateReqId('stream');
+        await wsClient.replyStream(frame, streamId, statusText, true);
+      } catch (e) { console.warn(`[WeCom] Status reply failed: ${e.message}`); }
+      return;
+    }
+
+    // /stop
+    if (/^\/stop\b/i.test(content)) {
+      try {
+        const streamId = generateReqId('stream');
+        await wsClient.replyStream(frame, streamId, '👋 Loop Agent stopping...', true);
+      } catch { /* best effort */ }
+      process.exit(0);
+    }
+
+    if (_runtime.processing) {
+      try {
+        const streamId = generateReqId('stream');
+        await wsClient.replyStream(frame, streamId, '⏳ Still processing, please wait...', true);
+      } catch { /* best effort */ }
+      return;
+    }
+
+    _runtime.processing = true;
+    try {
+      const { responseText } = await processUserMessage(content, {
+        agentGraph: ctx.agentGraph, graphState: ctx.graphState,
+        history: ctx.history, repoStore: ctx.repoStore,
+        loopKey: ctx.loopKey, historyPath: ctx.historyPath,
+      });
+
+      const chunks = splitWecomMessage(responseText);
+      for (const chunk of chunks) {
+        const streamId = generateReqId('stream');
+        await wsClient.replyStream(frame, streamId, chunk, true);
+      }
+      _runtime.processedCount++;
+      console.log(`[WeCom] Replied (${responseText.length} chars), total: ${_runtime.processedCount}`);
+    } catch (err) {
+      console.error(`[WeCom] Processing error: ${err.message}`);
+      try {
+        const streamId = generateReqId('stream');
+        await wsClient.replyStream(frame, streamId, `❌ Error: ${err.message}`, true);
+      } catch { /* best effort */ }
+    } finally {
+      _runtime.processing = false;
+    }
+  });
+
+  // Connect and wait for initial authentication
+  wsClient.connect();
+  console.log(`[WeCom] WebSocket connect() called, waiting for authentication...`);
+
+  const connectResult = await connectPromise;
+  console.log(`[WeCom] ✅ Connection result: ${connectResult}`);
+
+  return {
+    type: 'wecom',
+    async stop() {
+      if (stopped) return;
+      stopped = true;
+      console.log(`[WeCom] Stopping WebSocket...`);
+      try {
+        wsClient.disconnect();
+        // Wait for WebSocket to fully close
+        await new Promise(r => setTimeout(r, 500));
+      } catch (e) {
+        console.warn(`[WeCom] Error during disconnect: ${e.message}`);
+      }
+      console.log(`[WeCom] WebSocket stopped.`);
+    },
+    async sendMsg(text) {
+      // WeCom doesn't support server-initiated broadcast; skip
+      console.log(`[WeCom] (Browser message not forwarded — WeCom does not support server push)`);
+    },
+  };
+}
+
+// ─── Mode Switching ─────────────────────────────────────────────────
+
+/**
+ * Switch the active bidirectional listener at runtime.
+ * 1. Stop the current listener (Telegram bot / WeCom WebSocket)
+ * 2. Update pushoo channels
+ * 3. Start the new listener if the target is a bidirectional channel
+ */
+async function switchActiveListener(newChannels, ctx) {
+  console.log(`[Switch] ═══════════════════════════════════════════════════`);
+  console.log(`[Switch] Channel switch initiated at ${new Date().toISOString()}`);
+  console.log(`[Switch] New channels config: ${JSON.stringify(newChannels.map(c => ({ platform: c.platform, hasToken: !!c.token, tokenLen: c.token ? c.token.length : 0 })))}`);
+  console.log(`[Switch] Current listener: ${_runtime.listener ? _runtime.listener.type : 'none'}`);
+  console.log(`[Switch] Current pushooChannels: ${JSON.stringify(ctx.pushooChannels.map(c => c.platform))}`);
+
+  // Step 1: stop current listener
+  if (_runtime.listener) {
+    const oldType = _runtime.listener.type;
+    console.log(`[Switch] Step 1: Stopping ${oldType} listener...`);
+    try {
+      await _runtime.listener.stop();
+      console.log(`[Switch] Step 1: ✅ ${oldType} listener stopped successfully.`);
+    } catch (stopErr) {
+      console.error(`[Switch] Step 1: ⚠️ Error stopping ${oldType} listener: ${stopErr.message}`);
+      console.error(`[Switch] Step 1: Stack: ${stopErr.stack}`);
+    }
+    _runtime.listener = null;
+    // Grace period: allow the old connection (Telegram long-poll / WeCom WebSocket)
+    // to fully close before starting a new listener. This prevents 409 Conflict
+    // errors with Telegram or lingering WebSocket states.
+    const gracePeriodMs = 2500;
+    console.log(`[Switch] Step 1: Waiting ${gracePeriodMs}ms grace period for clean connection release...`);
+    await new Promise(r => setTimeout(r, gracePeriodMs));
+    console.log(`[Switch] Step 1: Grace period complete.`);
+  } else {
+    console.log(`[Switch] Step 1: No existing listener to stop.`);
+  }
+
+  // Step 2: update channels
+  const oldChannels = [...ctx.pushooChannels];
+  ctx.pushooChannels.length = 0;
+  ctx.pushooChannels.push(...newChannels);
+  console.log(`[Switch] Step 2: Channels updated. Old: [${oldChannels.map(c => c.platform)}] → New: [${ctx.pushooChannels.map(c => c.platform)}]`);
+
+  // Step 3: determine and start new listener
+  const tgChannel = newChannels.find(ch => ch.platform === 'telegram');
+  const wecomChannel = newChannels.find(ch => ch.platform === 'wecombot');
+  console.log(`[Switch] Step 3: Detecting target listener...`);
+  console.log(`[Switch]   Telegram channel found: ${!!tgChannel} (hasToken: ${!!(tgChannel && tgChannel.token)})`);
+  console.log(`[Switch]   WeCom channel found: ${!!wecomChannel} (hasToken: ${!!(wecomChannel && wecomChannel.token)})`);
+
+  let newListener = null;
+  if (tgChannel && tgChannel.token) {
+    console.log(`[Switch] Step 3: Creating Telegram listener...`);
+    try {
+      newListener = await createTelegramListener(ctx);
+      console.log(`[Switch] Step 3: ✅ Telegram listener created: ${newListener ? 'success' : 'returned null'}`);
+    } catch (createErr) {
+      console.error(`[Switch] Step 3: ❌ Failed to create Telegram listener: ${createErr.message}`);
+      console.error(`[Switch] Step 3: Stack: ${createErr.stack}`);
+    }
+  } else if (wecomChannel && wecomChannel.token) {
+    console.log(`[Switch] Step 3: Creating WeCom listener...`);
+    try {
+      newListener = await createWecomListener(ctx);
+      console.log(`[Switch] Step 3: ✅ WeCom listener created: ${newListener ? 'success' : 'returned null'}`);
+    } catch (createErr) {
+      console.error(`[Switch] Step 3: ❌ Failed to create WeCom listener: ${createErr.message}`);
+      console.error(`[Switch] Step 3: Stack: ${createErr.stack}`);
+    }
+  } else {
+    console.log(`[Switch] Step 3: No bidirectional channel detected — notification-only mode.`);
+  }
+
+  _runtime.listener = newListener;
+  const newType = newListener ? newListener.type : 'notification-only';
+  console.log(`[Switch] ✅ Switch complete. Active mode: ${newType}`);
+  console.log(`[Switch]   Channels: ${newChannels.map(c => c.platform).join(', ')}`);
+  console.log(`[Switch]   _runtime.listener type: ${_runtime.listener ? _runtime.listener.type : 'null'}`);
+  console.log(`[Switch] ═══════════════════════════════════════════════════`);
+
+  return newType;
+}
+
+// ─── Unified Browser Polling ────────────────────────────────────────
+//
+// Always-running polling loop that handles:
+// 1. Control commands (__SWITCH_CHANNEL__, __STATUS__, __WAKE__, etc.)
+// 2. Regular messages (processed through agent graph)
+//
+// When a bidirectional listener (Telegram/WeCom) is active, regular
+// messages from the browser are processed AND forwarded to the listener.
+// When no listener is active, responses go through pushoo notifications.
+
+function startBrowserPolling(ctx) {
+  const { upstash, repoStore, loopKey } = ctx;
+  if (!upstash && !repoStore) {
+    console.log(`[Browser Poll] DISABLED (no Upstash or RepoStore)`);
+    return;
+  }
+
+  const inboxKey = `loop:${loopKey}:inbox`;
+  const outboxKey = `loop:${loopKey}:outbox`;
+  const repoInboxPath = `loop-agent/channel/${loopKey}.inbox.json`;
+  const repoOutboxPath = `loop-agent/channel/${loopKey}.outbox.json`;
+  const basePollMs = ctx.pollInterval || 5000;
+
+  let currentInterval = basePollMs;
+  const maxInterval = basePollMs * 6;
+  let emptyPolls = 0;
+  const SLOW_THRESHOLD = 5;
+  let pollCount = 0;
+  let lastLogTime = Date.now();
+  const logIntervalMs = 30000;
+
+  console.log(`[Browser Poll] Starting (via ${upstash ? 'Upstash' : 'Repo'}, interval: ${basePollMs / 1000}s)`);
+
+  // Helpers
+  async function sendResponse(text) {
+    if (upstash) await upstash.set(outboxKey, createResponse(text));
+    else if (repoStore) await repoStore.writeFile(repoOutboxPath, createResponse(text), '[loop-agent] Response');
+  }
+
   async function updateStatus(state, extra = {}) {
     if (!upstash) return;
     try {
       await upstash.set(`loop:${loopKey}:status`, JSON.stringify({
         state,
-        startedAt: startTime,
-        model: `${aiProvider}/${aiModel}`,
-        processedCount,
-        inputMode: 'telegram',
+        startedAt: _runtime.startTime,
+        model: `${ctx.aiProvider}/${ctx.aiModel}`,
+        processedCount: _runtime.processedCount,
+        lastActive: Date.now(),
+        inputMode: _runtime.listener ? _runtime.listener.type : 'polling',
+        dormant: _runtime.dormant,
+        channels: ctx.pushooChannels.map(ch => ch.platform).join(', '),
         ...extra,
       }));
     } catch { /* non-critical */ }
   }
 
-  await updateStatus('running');
-
-  // Runtime watchdog — stop after maxRuntime, attempt self-restart
-  const runtimeTimer = setTimeout(async () => {
-    console.log(`[Telegram] Max runtime reached (${maxRuntime / 1000}s). Attempting restart...`);
-    try {
-      const restarted = await selfRestart();
-      const restartMsg = restarted
-        ? '♻️ Loop Agent restarting (max runtime). A new run is being dispatched...'
-        : '⏱ Loop Agent shutting down (max runtime). Auto-restart failed — please re-deploy.';
-      await bot.telegram.sendMessage(chatId, restartMsg);
-    } catch { /* best effort */ }
-    await updateStatus('restarting', { stoppedAt: Date.now() });
-    bot.stop('MAX_RUNTIME');
-    process.exit(0);
-  }, maxRuntime);
-
-  // Handle /start command
-  bot.command('start', async (ctx) => {
-    await ctx.reply(
-      `🤖 Loop Agent is running!\n\n` +
-      `Key: ${loopKey}\n` +
-      `Model: ${aiProvider}/${aiModel}\n\n` +
-      `Commands:\n/start — Show this info\n/status — Agent status\n/stop — Stop the agent`
-    );
-  });
-
-  // Handle /status command
-  bot.command('status', async (ctx) => {
-    const elapsed = Math.round((Date.now() - startTime) / 60000);
-    const remaining = Math.round((maxRuntime - (Date.now() - startTime)) / 60000);
-    await ctx.reply(
-      `📊 Agent Status\n\n` +
-      `Processed: ${processedCount} messages\n` +
-      `Running: ${elapsed} min\n` +
-      `Remaining: ~${remaining} min\n` +
-      `Model: ${aiProvider}/${aiModel}\n` +
-      `Currently processing: ${processing ? 'yes' : 'idle'}`
-    );
-  });
-
-  // Handle /stop command
-  bot.command('stop', async (ctx) => {
-    await ctx.reply('👋 Loop Agent stopping...');
-    clearTimeout(runtimeTimer);
-    await updateStatus('stopped', { stoppedAt: Date.now() });
-    bot.stop('USER_STOP');
-    process.exit(0);
-  });
-
-  // Handle text messages — process with agent
-  bot.on('text', async (ctx) => {
-    const msg = ctx.message;
-
-    // Security: only accept from the authorized chat
-    if (chatId && String(msg.chat.id) !== String(chatId)) {
-      console.log(`[Telegram] Ignoring message from unauthorized chat: ${msg.chat.id}`);
-      return;
-    }
-
-    const text = msg.text;
-    if (!text) return;
-    // Skip Telegraf-handled bot commands (/start /status /stop) but allow our custom slash commands
-    if (text.startsWith('/') && /^\/(start|status|stop)\b/i.test(text)) return;
-
-    // Prevent concurrent processing
-    if (processing) {
-      await ctx.reply('⏳ Still processing the previous message, please wait...');
-      return;
-    }
-
-    processing = true;
-    console.log(`[Telegram] Received message (${text.length} chars)`);
-
-    try {
-      // Send "typing" indicator
-      await ctx.sendChatAction('typing');
-
-      const { responseText } = await processUserMessage(text, { agentGraph, graphState, history, repoStore, loopKey, historyPath });
-
-      // Reply via Telegram (split long messages)
-      const chunks = splitTelegramMessage(responseText);
-      for (const chunk of chunks) {
-        await ctx.reply(chunk);
-      }
-
-      processedCount++;
-      await updateStatus('running', { lastActive: Date.now() });
-      console.log(`[Telegram] Replied (${responseText.length} chars), total: ${processedCount}`);
-    } catch (err) {
-      console.error(`[Telegram] Processing error: ${err.message}`);
-      try {
-        await ctx.reply(`❌ Error: ${err.message}`);
-      } catch { /* best effort */ }
-    } finally {
-      processing = false;
-    }
-  });
-
-  // Error handler
-  bot.catch((err) => {
-    console.error(`[Telegram] Bot error: ${err.message}`);
-  });
-
-  // Graceful shutdown — attempt restart on SIGTERM (Actions cancellation)
-  const shutdown = async (signal) => {
-    console.log(`[Telegram] ${signal} received, stopping bot...`);
-    clearTimeout(runtimeTimer);
-    // On SIGTERM (Actions cancel), try to self-restart
-    if (signal === 'SIGTERM') {
-      console.log(`[Telegram] Attempting self-restart after ${signal}...`);
-      const restarted = await selfRestart();
-      try {
-        if (chatId) {
-          const msg = restarted
-            ? `♻️ Loop Agent was interrupted (${signal}). Restarting...`
-            : `⚠️ Loop Agent was interrupted (${signal}). Auto-restart failed.`;
-          await bot.telegram.sendMessage(chatId, msg);
-        }
-      } catch { /* best effort */ }
-      await updateStatus('restarting', { stoppedAt: Date.now() });
-    } else {
-      await updateStatus('stopped', { stoppedAt: Date.now() });
-    }
-    bot.stop(signal);
-    process.exit(0);
-  };
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-
-
-  // Keep process alive — Telegraf handles the polling loop internally
-  // Also poll for browser intervention messages (Upstash or repo-based)
-  const interventionPollMs = pollInterval || 5000;
-  
-  if (upstash || repoStore) {
-    const inboxKey = `loop:${loopKey}:inbox`;
-    const outboxKey = `loop:${loopKey}:outbox`;
-    const repoInboxPath = `loop-agent/channel/${loopKey}.inbox.json`;
-    const repoOutboxPath = `loop-agent/channel/${loopKey}.outbox.json`;
-
-    console.log(`[Telegram] ✓ Starting browser intervention polling (via ${upstash ? 'Upstash' : 'Repo'})`);
-
-    // Adaptive polling: slow down when idle, speed up on activity
-    let currentInterval = interventionPollMs;
-    const maxInterval = interventionPollMs * 6; // 6x slowdown when idle
-    let emptyPolls = 0;
-    const SLOW_THRESHOLD = 5; // slow down after 5 consecutive empty polls
-
-    const pollOnce = async () => {
-      if (processing) {
-        setTimeout(pollOnce, currentInterval);
-        return;
-      }
-      
-      try {
-        let msg = null;
-        
-        if (upstash) {
-          const raw = await upstash.get(inboxKey);
-          msg = parseMessage(raw);
-          if (msg) {
-            await upstash.set(inboxKey, markAsRead(msg));
-          }
-        } else {
-          const file = await repoStore.readFile(repoInboxPath);
-          if (file) {
-            msg = parseMessage(file.content);
-            if (msg) {
-              try {
-                await repoStore.writeFile(repoInboxPath, markAsRead(msg), '[loop-agent] Mark inbox read');
-              } catch (e) { console.warn(`[Browser Poll] Failed to mark inbox read: ${e.message}`); }
-            }
-          }
-        }
-        
-        if (!msg) {
-          emptyPolls++;
-          if (emptyPolls === SLOW_THRESHOLD) {
-            currentInterval = maxInterval;
-            console.log(`[Browser Poll] No messages for ${SLOW_THRESHOLD} polls, slowing to ${currentInterval / 1000}s`);
-          }
-          setTimeout(pollOnce, currentInterval);
-          return;
-        }
-
-        // Got a message — reset to fast polling
-        if (emptyPolls >= SLOW_THRESHOLD) {
-          console.log(`[Browser Poll] Message received, restoring fast polling (${interventionPollMs / 1000}s)`);
-        }
-        emptyPolls = 0;
-        currentInterval = interventionPollMs;
-
-        if (processing) { setTimeout(pollOnce, currentInterval); return; }
-        processing = true;
-        console.log(`[Browser Poll] Processing browser message (${msg.text.length} chars)`);
-        try {
-          const { responseText } = await processUserMessage(msg.text, {
-            agentGraph, graphState, history, repoStore, loopKey, historyPath,
-          });
-          console.log(`[Browser Poll] Response ready (${responseText.length} chars)`);
-          
-          if (upstash) {
-            await upstash.set(outboxKey, createResponse(responseText));
-          } else {
-            await repoStore.writeFile(repoOutboxPath, createResponse(responseText), '[loop-agent] Write intervention response');
-          }
-          // Also forward to Telegram
-          if (chatId) {
-            try {
-              const chunks = splitTelegramMessage(`📩 [Browser]\n${responseText}`);
-              for (const chunk of chunks) {
-                await bot.telegram.sendMessage(chatId, chunk);
-              }
-            } catch (e) { console.warn(`[Browser Poll] Failed to forward to Telegram: ${e.message}`); }
-          }
-          processedCount++;
-          await updateStatus('running', { lastActive: Date.now() });
-        } catch (processingErr) {
-          console.error(`[Browser Poll] Processing error: ${processingErr.message}`);
-        } finally {
-          processing = false;
-        }
-      } catch (e) {
-        console.error(`[Browser Poll] Poll error: ${e.message}`);
-      }
-      setTimeout(pollOnce, currentInterval);
-    };
-    setTimeout(pollOnce, interventionPollMs);
-  } else {
-    console.log(`[Telegram] ⚠️  Intervention polling DISABLED (no upstash or repoStore available)`);
-  }
-
-  // Launch bot polling
-  // [IMPORTANT] must put below code in the end of function
-  // [IMPORTANT] launch won't exit in polling mode
-  await bot.launch({
-    polling: {
-      interval: 300,
-      timeout: 30,
-      allowedUpdates: ['message'],
-    },
-  });
-
-  console.log(`[Telegram] ✅ Bot polling started. Waiting for messages...`);
-
-  await new Promise(() => {}); // block forever (until shutdown)
-}
-
-/**
- * Run in Upstash mode: poll Upstash for messages and reply via Pushoo.
- * This is the original behaviour.
- */
-async function runUpstashMode({
-  upstash, agentGraph, graphState, history, repoStore, loopKey, historyPath,
-  pushooPlatform, pushooToken,
-  maxRuntime, pollInterval, aiProvider, aiModel,
-}) {
-  const inboxKey = `loop:${loopKey}:inbox`;
-  const outboxKey = `loop:${loopKey}:outbox`;
-  const startTime = Date.now();
-  let processedCount = 0;
-  let pollCount = 0;
-  let dormant = false; // When true, ignore regular messages (only respond to control messages)
-
-  // Adaptive polling: slow down when idle, speed up on activity
-  let currentPollInterval = pollInterval;
-  const maxPollInterval = pollInterval * 6;
-  let emptyPolls = 0;
-  const SLOW_THRESHOLD = 5;
-
-  console.log(`[Upstash Mode] Starting polling loop`);
-  console.log(`[Upstash Mode] Polling keys — inbox: ${inboxKey}, outbox: ${outboxKey}`);
-  console.log(`[Upstash Mode] Poll interval: ${pollInterval / 1000}s (adaptive: slows to ${maxPollInterval / 1000}s when idle)`);
-
-  // Write initial status
-  try {
-    await upstash.set(`loop:${loopKey}:status`, JSON.stringify({
-      state: 'running',
-      startedAt: startTime,
-      model: `${aiProvider}/${aiModel}`,
-      processedCount: 0,
-      inputMode: 'upstash',
-    }));
-  } catch (e) {
-    console.warn(`[Status] Failed to write initial status: ${e.message}`);
-  }
-
-  // ── Main polling loop ──
-  let lastLogTime = startTime;
-  const logIntervalMs = 30000; // Log every 30 seconds
-  let upstashPollCount = 0; // Track polling attempts for debugging
-
-  /**
-   * Handle control messages (prefixed with __).
-   * Returns { handled: true, ... } if the message was a control message.
-   */
+  // ── Control message handler ──
   async function handleControlMessage(text) {
-    // ── __ROLL_CALL__ — respond with name and last conversation content
+    // __ROLL_CALL__
     if (text === '__ROLL_CALL__') {
-      const lastMsg = history.messages.length > 0
-        ? history.messages[history.messages.length - 1]
+      const lastMsg = ctx.history.messages.length > 0
+        ? ctx.history.messages[ctx.history.messages.length - 1]
         : null;
       const lastContent = lastMsg
         ? `[${lastMsg.role}] ${lastMsg.content.length > 200 ? lastMsg.content.slice(0, 200) + '…' : lastMsg.content}`
         : '(no conversation yet)';
-      const statusLabel = dormant ? '💤 dormant' : '🟢 active';
-      const response = `📋 **${loopKey}** (${statusLabel})\nModel: ${aiProvider}/${aiModel}\nProcessed: ${processedCount} msgs\nLast: ${lastContent}`;
-      await upstash.set(outboxKey, createResponse(response));
+      const statusLabel = _runtime.dormant ? '💤 dormant' : '🟢 active';
+      const listenerLabel = _runtime.listener ? _runtime.listener.type : 'polling';
+      const response = `📋 **${loopKey}** (${statusLabel}, ${listenerLabel})\nModel: ${ctx.aiProvider}/${ctx.aiModel}\nProcessed: ${_runtime.processedCount} msgs\nLast: ${lastContent}`;
+      await sendResponse(response);
       console.log(`[Control] ROLL_CALL responded`);
       return { handled: true };
     }
 
-    // ── __FOCUS__:<name> — if name matches, stay active; otherwise go dormant
+    // __FOCUS__:<name>
     if (text.startsWith('__FOCUS__:')) {
       const targetName = text.slice('__FOCUS__:'.length).trim();
       if (targetName === loopKey) {
-        dormant = false;
-        const response = `🎯 **${loopKey}** is now the active agent. Ready for messages.`;
-        await upstash.set(outboxKey, createResponse(response));
+        _runtime.dormant = false;
+        await sendResponse(`🎯 **${loopKey}** is now the active agent. Ready for messages.`);
         console.log(`[Control] FOCUS — I am the target, staying active`);
-        // Update status
-        try {
-          await upstash.set(`loop:${loopKey}:status`, JSON.stringify({
-            state: 'running',
-            startedAt: startTime,
-            model: `${aiProvider}/${aiModel}`,
-            processedCount,
-            lastActive: Date.now(),
-            inputMode: 'upstash',
-            dormant: false,
-          }));
-        } catch { /* non-critical */ }
       } else {
-        dormant = true;
-        const response = `💤 **${loopKey}** entering dormant mode. Focus is on **${targetName}**.`;
-        await upstash.set(outboxKey, createResponse(response));
+        _runtime.dormant = true;
+        await sendResponse(`💤 **${loopKey}** entering dormant mode. Focus is on **${targetName}**.`);
         console.log(`[Control] FOCUS — target is ${targetName}, going dormant`);
-        // Update status
-        try {
-          await upstash.set(`loop:${loopKey}:status`, JSON.stringify({
-            state: 'dormant',
-            startedAt: startTime,
-            model: `${aiProvider}/${aiModel}`,
-            processedCount,
-            lastActive: Date.now(),
-            inputMode: 'upstash',
-            dormant: true,
-          }));
-        } catch { /* non-critical */ }
       }
+      await updateStatus(_runtime.dormant ? 'dormant' : 'running');
       return { handled: true };
     }
 
-    // ── __WAKE__ — wake up from dormant state
+    // __WAKE__
     if (text === '__WAKE__') {
-      dormant = false;
-      const response = `🟢 **${loopKey}** is now awake and active.`;
-      await upstash.set(outboxKey, createResponse(response));
+      _runtime.dormant = false;
+      await sendResponse(`🟢 **${loopKey}** is now awake and active.`);
+      await updateStatus('running');
       console.log(`[Control] WAKE — resuming active mode`);
-      // Update status
+      return { handled: true };
+    }
+
+    // __SWITCH_CHANNEL__:<json> — the key command: stop old listener, start new
+    if (text.startsWith('__SWITCH_CHANNEL__:')) {
+      const channelJson = text.slice('__SWITCH_CHANNEL__:'.length).trim();
+      console.log(`[Control] ────────────────────────────────────────────`);
+      console.log(`[Control] SWITCH_CHANNEL received at ${new Date().toISOString()}`);
+      console.log(`[Control] Raw payload: ${channelJson}`);
+      console.log(`[Control] Payload length: ${channelJson.length} chars`);
       try {
-        await upstash.set(`loop:${loopKey}:status`, JSON.stringify({
-          state: 'running',
-          startedAt: startTime,
-          model: `${aiProvider}/${aiModel}`,
-          processedCount,
-          lastActive: Date.now(),
-          inputMode: 'upstash',
-          dormant: false,
-        }));
-      } catch { /* non-critical */ }
+        const newChannels = JSON.parse(channelJson);
+        console.log(`[Control] Parsed channels: ${JSON.stringify(newChannels)}`);
+        console.log(`[Control] Channel count: ${newChannels.length}`);
+        console.log(`[Control] Channel platforms: ${newChannels.map(ch => ch.platform).join(', ')}`);
+        console.log(`[Control] Channel token lengths: ${newChannels.map(ch => `${ch.platform}=${ch.token ? ch.token.length : 0}`).join(', ')}`);
+        if (Array.isArray(newChannels) && newChannels.length > 0) {
+          console.log(`[Control] Validation passed. Calling switchActiveListener()...`);
+          const switchStart = Date.now();
+          const newType = await switchActiveListener(newChannels, ctx);
+          const switchDuration = Date.now() - switchStart;
+          const summary = newChannels.map(ch => ch.platform).join(', ');
+          console.log(`[Control] switchActiveListener() returned: ${newType} (took ${switchDuration}ms)`);
+          const responseMsg = `📡 **${loopKey}** switched to **${newType}** (channels: ${summary})`;
+          console.log(`[Control] Sending response: ${responseMsg}`);
+          await sendResponse(responseMsg);
+          await updateStatus('running');
+          console.log(`[Control] ✅ SWITCH_CHANNEL complete → ${newType} (${summary})`);
+        } else {
+          console.warn(`[Control] ⚠️ Validation failed: array is empty or not an array. isArray=${Array.isArray(newChannels)}, length=${newChannels.length}`);
+          await sendResponse(`⚠️ Invalid channel config: expected non-empty array.`);
+        }
+      } catch (e) {
+        console.error(`[Control] ❌ SWITCH_CHANNEL error: ${e.message}`);
+        console.error(`[Control] Error stack: ${e.stack}`);
+        console.error(`[Control] Raw channelJson that failed: ${channelJson}`);
+        await sendResponse(`⚠️ Channel switch failed: ${e.message}`);
+      }
+      console.log(`[Control] ────────────────────────────────────────────`);
+      return { handled: true };
+    }
+
+    // __STATUS__
+    if (text === '__STATUS__') {
+      const elapsedMin = Math.round((Date.now() - _runtime.startTime) / 60000);
+      const channelList = ctx.pushooChannels.map(ch => ch.platform).join(', ') || 'none';
+      const listenerType = _runtime.listener ? _runtime.listener.type : 'none';
+      const memUsage = process.memoryUsage();
+      const status = [
+        `📊 **${loopKey}** Status`,
+        `State: ${_runtime.dormant ? '💤 dormant' : '🟢 active'}`,
+        `Listener: ${listenerType}`,
+        `Runtime: ${elapsedMin} min`,
+        `Messages processed: ${_runtime.processedCount}`,
+        `Model: ${ctx.aiProvider}/${ctx.aiModel}`,
+        `Channels: ${channelList}`,
+        `Upstash: ${upstash ? '✓' : '✗'}`,
+        `Memory: ${Math.round(memUsage.heapUsed / 1048576)}MB / ${Math.round(memUsage.heapTotal / 1048576)}MB`,
+      ].join('\n');
+      await sendResponse(status);
+      console.log(`[Control] STATUS responded`);
       return { handled: true };
     }
 
     return { handled: false };
   }
 
-  while (true) {
-    // Check runtime limit
-    const elapsed = Date.now() - startTime;
-    if (elapsed >= maxRuntime) {
-      console.log(`[Loop Agent] Max runtime reached (${maxRuntime / 1000}s). Attempting restart...`);
-      const restarted = await selfRestart();
-      const restartMsg = restarted
-        ? `♻️ Loop Agent restarting (max runtime). Processed ${processedCount} messages in ${Math.round(elapsed / 60000)} minutes. A new run is being dispatched.`
-        : `⏱ Loop Agent shutting down (max runtime). Processed ${processedCount} messages. Auto-restart failed.`;
-      await sendPushoo(pushooPlatform, pushooToken,
-        `[Reply] [Loop Agent] ${restarted ? 'Restarting' : 'Shutting Down'}`,
-        restartMsg);
-      break;
-    }
-
-    let gotMessage = false;
+  // ── Polling loop ──
+  const pollOnce = async () => {
     try {
-      // Poll for new message
       pollCount++;
-      upstashPollCount++;
       const now = Date.now();
-      const nowIso = new Date().toISOString();
-      const timeSinceLastLog = now - lastLogTime;
-      
-      if (timeSinceLastLog >= logIntervalMs) {
-        // Log every 30s to show the agent is alive and polling
-        const elapsedMin = Math.round((now - startTime) / 60000);
-        console.log(`[Upstash Mode] ✓ Polling active (${elapsedMin}min elapsed, ${pollCount} polls, ${processedCount} msgs processed, dormant=${dormant})`);
+
+      // Periodic alive log
+      if (now - lastLogTime >= logIntervalMs) {
+        const elapsedMin = Math.round((now - _runtime.startTime) / 60000);
+        const listenerLabel = _runtime.listener ? _runtime.listener.type : 'none';
+        console.log(`[Browser Poll] ✓ Active (${elapsedMin}min, ${pollCount} polls, ${_runtime.processedCount} msgs, listener=${listenerLabel}, dormant=${_runtime.dormant})`);
         lastLogTime = now;
       }
-      
-      let raw;
-      try {
-        console.log(`[Upstash Poll #${upstashPollCount}] [${nowIso}] Calling upstash.get("${inboxKey}")...`);
-        raw = await upstash.get(inboxKey);
-        console.log(`[Upstash Poll #${upstashPollCount}] Raw response: ${raw ? `(type=${typeof raw}, len=${JSON.stringify(raw).length}) ${JSON.stringify(raw).slice(0, 300)}` : 'null/empty'}`);
-      } catch (e) {
-        console.error(`[Upstash Poll #${upstashPollCount}] ❌ Get failed: ${e.message}`);
-        throw e;
+
+      // Check runtime limit
+      if (now - _runtime.startTime >= ctx.maxRuntime) {
+        console.log(`[Browser Poll] Max runtime reached (${ctx.maxRuntime / 1000}s). Attempting restart...`);
+        if (_runtime.listener) await _runtime.listener.stop();
+        const restarted = await selfRestart();
+        const msg = restarted
+          ? `♻️ Loop Agent restarting (max runtime). Processed ${_runtime.processedCount} messages.`
+          : `⏱ Loop Agent shutting down (max runtime). Processed ${_runtime.processedCount} messages.`;
+        await sendNotifications(ctx.pushooChannels, `[Loop Agent] ${restarted ? 'Restarting' : 'Shutting Down'}`, msg);
+        await updateStatus('restarting', { stoppedAt: Date.now() });
+        process.exit(0);
       }
-      
-      const msg = parseMessage(raw);
-      console.log(`[Upstash Poll #${upstashPollCount}] Parsed: ${msg ? `unread msg: "${msg.text.slice(0, 80).replace(/\n/g, ' ')}..."` : 'null/empty (no unread message)'}`);
 
-      if (msg) {
-        gotMessage = true;
-        console.log(`[Upstash Poll #${upstashPollCount}] ✓ Found unread message, marking as read...`);
-        // Mark as read immediately
-        await upstash.set(inboxKey, markAsRead(msg));
-        console.log(`[Upstash Poll #${upstashPollCount}] ✓ Marked as read in upstash`);
+      // Skip polling if processing
+      if (_runtime.processing) {
+        _runtime.pollTimer = setTimeout(pollOnce, currentInterval);
+        return;
+      }
 
-        // Check for control messages first (always handled, even when dormant)
-        console.log(`[Upstash Poll #${upstashPollCount}] Checking if message is control message...`);
+      // Poll for message
+      let msg = null;
+      if (upstash) {
+        const raw = await upstash.get(inboxKey);
+        msg = parseMessage(raw);
+        if (msg) await upstash.set(inboxKey, markAsRead(msg));
+      } else if (repoStore) {
+        const file = await repoStore.readFile(repoInboxPath);
+        if (file) {
+          msg = parseMessage(file.content);
+          if (msg) {
+            try { await repoStore.writeFile(repoInboxPath, markAsRead(msg), '[loop-agent] Mark read'); }
+            catch (e) { console.warn(`[Browser Poll] Mark read failed: ${e.message}`); }
+          }
+        }
+      }
+
+      if (!msg) {
+        emptyPolls++;
+        if (emptyPolls === SLOW_THRESHOLD) {
+          currentInterval = maxInterval;
+          console.log(`[Browser Poll] Idle, slowing to ${currentInterval / 1000}s`);
+        }
+        _runtime.pollTimer = setTimeout(pollOnce, currentInterval);
+        return;
+      }
+
+      // Got a message — reset to fast polling
+      if (emptyPolls >= SLOW_THRESHOLD) {
+        console.log(`[Browser Poll] Message received, restoring ${basePollMs / 1000}s interval`);
+      }
+      emptyPolls = 0;
+      currentInterval = basePollMs;
+
+      // ── Control messages (always processed, even when dormant) ──
+      if (msg.text.startsWith('__')) {
         const ctrl = await handleControlMessage(msg.text);
         if (ctrl.handled) {
-          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Processed as control message`);
-          // Control message handled — skip normal processing
-        } else if (dormant) {
-          // Dormant mode — ignore regular messages silently
-          console.log(`[Upstash Poll #${upstashPollCount}] ⏸ Dormant mode — ignoring message (${msg.text.length} chars)`);
-        } else {
-          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Processing regular message (${msg.text.length} chars)`);
-          console.time(`[Upstash Poll #${upstashPollCount}] Message processing`);
-
-          const { responseText } = await processUserMessage(msg.text, { agentGraph, graphState, history, repoStore, loopKey, historyPath });
-          console.timeEnd(`[Upstash Poll #${upstashPollCount}] Message processing`);
-          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Response ready (${responseText.length} chars)`);
-
-          // Write response to outbox
-          console.log(`[Upstash Poll #${upstashPollCount}] Writing response to outbox key...`);
-          await upstash.set(outboxKey, createResponse(responseText));
-          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Response written to upstash outbox`);
-
-          // Notify user via Pushoo
-          const truncated = responseText.length > 500
-            ? responseText.slice(0, 500) + '...'
-            : responseText;
-          console.log(`[Upstash Poll #${upstashPollCount}] Sending notification via Pushoo (${pushooPlatform})...`);
-          await sendPushoo(pushooPlatform, pushooToken,
-            `[Reply] [Loop Agent] Reply`,
-            truncated);
-          console.log(`[Upstash Poll #${upstashPollCount}] ✓ Pushoo notification sent`);
-
-          processedCount++;
-
-          // Update status
-          try {
-            await upstash.set(`loop:${loopKey}:status`, JSON.stringify({
-              state: 'running',
-              startedAt: startTime,
-              model: `${aiProvider}/${aiModel}`,
-              processedCount,
-              lastActive: Date.now(),
-              inputMode: 'upstash',
-            }));
-          } catch { /* non-critical */ }
+          _runtime.pollTimer = setTimeout(pollOnce, currentInterval);
+          return;
         }
       }
-    } catch (pollErr) {
-      console.error(`[Upstash Poll #${upstashPollCount}] ❌ Poll error: ${pollErr.message}`);
-      if (pollErr.stack) console.error(`[Upstash Poll #${upstashPollCount}] Stack: ${pollErr.stack.split('\n').slice(0, 3).join('\n')}`);
-    }
 
-    // Adaptive polling: slow down when idle, speed up on activity
-    if (gotMessage) {
-      emptyPolls = 0;
-      if (currentPollInterval !== pollInterval) {
-        currentPollInterval = pollInterval;
-        console.log(`[Upstash Mode] Message received, restoring fast polling (${currentPollInterval / 1000}s)`);
+      // ── Dormant mode — ignore regular messages ──
+      if (_runtime.dormant) {
+        console.log(`[Browser Poll] Dormant — ignoring message (${msg.text.length} chars)`);
+        _runtime.pollTimer = setTimeout(pollOnce, currentInterval);
+        return;
       }
-    } else {
-      emptyPolls++;
-      if (emptyPolls === SLOW_THRESHOLD && currentPollInterval === pollInterval) {
-        currentPollInterval = maxPollInterval;
-        console.log(`[Upstash Mode] No messages for ${SLOW_THRESHOLD} polls, slowing to ${currentPollInterval / 1000}s`);
-      }
-    }
 
-    // Wait before next poll
-    await new Promise(r => setTimeout(r, currentPollInterval));
-  }
+      // ── Regular message — process through agent graph ──
+      _runtime.processing = true;
+      console.log(`[Browser Poll] Processing message (${msg.text.length} chars)`);
 
-  // Final status update
-  try {
-    await upstash.set(`loop:${loopKey}:status`, JSON.stringify({
-      state: 'restarting',
-      startedAt: startTime,
-      stoppedAt: Date.now(),
-      model: `${aiProvider}/${aiModel}`,
-      processedCount,
-      inputMode: 'upstash',
-    }));
-  } catch { /* non-critical */ }
+      try {
+        const { responseText } = await processUserMessage(msg.text, {
+          agentGraph: ctx.agentGraph, graphState: ctx.graphState,
+          history: ctx.history, repoStore: ctx.repoStore,
+          loopKey: ctx.loopKey, historyPath: ctx.historyPath,
+        });
 
-  process.exit(0);
-}
+        console.log(`[Browser Poll] Response (${responseText.length} chars)`);
 
-/**
- * Run in Repo mode: poll GitHub repo for messages and reply via Pushoo.
- * Fallback when neither Telegram nor Upstash is configured.
- * Browser writes to loop-agent/channel/{loopKey}.inbox.json
- * Runner writes to loop-agent/channel/{loopKey}.outbox.json
- */
-async function runRepoMode({
-  agentGraph, graphState, history, repoStore, loopKey, historyPath,
-  pushooPlatform, pushooToken,
-  maxRuntime, pollInterval, aiProvider, aiModel,
-}) {
-  const inboxPath = `loop-agent/channel/${loopKey}.inbox.json`;
-  const outboxPath = `loop-agent/channel/${loopKey}.outbox.json`;
-  const startTime = Date.now();
-  let processedCount = 0;
+        // Send response to browser (Upstash outbox)
+        await sendResponse(responseText);
 
-  // Adaptive polling: slow down when idle, speed up on activity
-  let repoCurrentInterval = pollInterval;
-  const repoMaxInterval = pollInterval * 6;
-  let repoEmptyPolls = 0;
-  const REPO_SLOW_THRESHOLD = 5;
+        // Forward to active listener if available
+        if (_runtime.listener && _runtime.listener.sendMsg) {
+          try { await _runtime.listener.sendMsg(responseText); } catch { /* best effort */ }
+        }
 
-  console.log(`[RepoMode] Starting repo-based polling mode`);
-  console.log(`[RepoMode] Inbox: ${inboxPath}`);
-  console.log(`[RepoMode] Outbox: ${outboxPath}`);
-  console.log(`[RepoMode] Poll interval: ${pollInterval / 1000}s (adaptive: slows to ${repoMaxInterval / 1000}s when idle)`);
-
-  while (true) {
-    const elapsed = Date.now() - startTime;
-    if (elapsed >= maxRuntime) {
-      console.log(`[RepoMode] Max runtime reached (${maxRuntime / 1000}s). Attempting restart...`);
-      const restarted = await selfRestart();
-      const restartMsg = restarted
-        ? `♻️ Loop Agent restarting (max runtime). Processed ${processedCount} messages in ${Math.round(elapsed / 60000)} minutes.`
-        : `⏱ Loop Agent shutting down (max runtime). Processed ${processedCount} messages.`;
-      await sendPushoo(pushooPlatform, pushooToken,
-        `[Loop Agent] ${restarted ? 'Restarting' : 'Shutting Down'}`, restartMsg);
-      break;
-    }
-
-    let repoGotMessage = false;
-    try {
-      const file = await repoStore.readFile(inboxPath);
-      if (file) {
-        const msg = parseMessage(file.content);
-        if (msg) {
-          repoGotMessage = true;
-          console.log(`[RepoMode] Received message (${msg.text.length} chars)`);
-
-          // Mark inbox as read
-          try {
-            await repoStore.writeFile(inboxPath, markAsRead(msg), '[loop-agent] Mark inbox read');
-          } catch (e) {
-            console.warn(`[RepoMode] Failed to mark inbox read: ${e.message}`);
-          }
-
-          const { responseText } = await processUserMessage(msg.text, {
-            agentGraph, graphState, history, repoStore, loopKey, historyPath,
-          });
-
-          // Write response to outbox
-          try {
-            await repoStore.writeFile(outboxPath, createResponse(responseText), '[loop-agent] Write response');
-          } catch (e) {
-            console.warn(`[RepoMode] Failed to write outbox: ${e.message}`);
-          }
-
-          // Notify via pushoo
+        // Send pushoo notifications (for non-bidirectional channels)
+        // In notification-only mode, this is the only way the user gets responses
+        if (!_runtime.listener) {
           const truncated = responseText.length > 500 ? responseText.slice(0, 500) + '...' : responseText;
-          await sendPushoo(pushooPlatform, pushooToken, `[Reply] [Loop Agent] Reply`, truncated);
-          processedCount++;
+          await sendNotifications(ctx.pushooChannels, `[Reply] [Loop Agent] Reply`, truncated);
         }
+
+        _runtime.processedCount++;
+        await updateStatus('running', { lastActive: Date.now() });
+      } catch (e) {
+        console.error(`[Browser Poll] Processing error: ${e.message}`);
+        await sendResponse(`❌ Error: ${e.message}`);
+      } finally {
+        _runtime.processing = false;
       }
     } catch (e) {
-      console.warn(`[RepoMode] Poll error: ${e.message}`);
+      console.error(`[Browser Poll] Poll error: ${e.message}`);
     }
 
-    // Adaptive polling: slow down when idle, speed up on activity
-    if (repoGotMessage) {
-      repoEmptyPolls = 0;
-      if (repoCurrentInterval !== pollInterval) {
-        repoCurrentInterval = pollInterval;
-        console.log(`[RepoMode] Message received, restoring fast polling (${repoCurrentInterval / 1000}s)`);
-      }
-    } else {
-      repoEmptyPolls++;
-      if (repoEmptyPolls === REPO_SLOW_THRESHOLD && repoCurrentInterval === pollInterval) {
-        repoCurrentInterval = repoMaxInterval;
-        console.log(`[RepoMode] No messages for ${REPO_SLOW_THRESHOLD} polls, slowing to ${repoCurrentInterval / 1000}s`);
-      }
-    }
+    _runtime.pollTimer = setTimeout(pollOnce, currentInterval);
+  };
 
-    await new Promise(r => setTimeout(r, repoCurrentInterval));
-  }
+  // Write initial status
+  updateStatus('running').catch(() => {});
 
-  process.exit(0);
+  _runtime.pollTimer = setTimeout(pollOnce, basePollMs);
 }
+
+// ─── Main Entry Point ───────────────────────────────────────────────
 
 async function main() {
   const UPSTASH_URL = process.env.UPSTASH_URL;
@@ -2607,8 +3659,7 @@ async function main() {
   const AI_PROVIDER = process.env.AI_PROVIDER || 'gemini';
   const AI_MODEL = process.env.AI_MODEL || 'gemini-2.0-flash';
   const AI_API_KEY = process.env.AI_API_KEY;
-  const PUSHOO_PLATFORM = process.env.PUSHOO_PLATFORM;
-  const PUSHOO_TOKEN_VAL = process.env.PUSHOO_TOKEN;
+  const PUSHOO_CHANNELS = parsePushooChannels();
   const GH_PAT = process.env.GH_PAT;
   const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY;
   const LOOP_WORKFLOW_FILE = process.env.LOOP_WORKFLOW_FILE || '';
@@ -2617,13 +3668,17 @@ async function main() {
   const MAX_RUNTIME = parseInt(process.env.LOOP_MAX_RUNTIME || '18000', 10) * 1000;
   const SYSTEM_PROMPT = process.env.LOOP_SYSTEM_PROMPT || '';
 
-  const useTelegram = isTelegramPlatform(PUSHOO_PLATFORM) && PUSHOO_TOKEN_VAL;
+  // Extract channel configs
+  const telegramChannel = PUSHOO_CHANNELS.find(ch => ch.platform === 'telegram');
+  const wecomChannel = PUSHOO_CHANNELS.find(ch => ch.platform === 'wecombot');
+  const useTelegram = !!(telegramChannel && telegramChannel.token);
+  const useWecom = !!(wecomChannel && wecomChannel.token);
   const hasUpstash = !!(UPSTASH_URL && UPSTASH_TOKEN);
   const hasRepoStore = !!(GH_PAT && GITHUB_REPOSITORY);
 
   // Validate required env
-  if (!useTelegram && !hasUpstash && !hasRepoStore) {
-    console.error('[FATAL] Either Telegram, Upstash, or GitHub repo access (GH_PAT) is required for messaging');
+  if (!useTelegram && !useWecom && !hasUpstash && !hasRepoStore) {
+    console.error('[FATAL] Either Telegram, WeCom Bot, Upstash, or GitHub repo access (GH_PAT) is required for messaging');
     process.exit(1);
   }
   if (!LOOP_KEY) {
@@ -2635,22 +3690,19 @@ async function main() {
     process.exit(1);
   }
 
-  const inputMode = useTelegram ? 'Telegram' : hasUpstash ? 'Upstash' : 'Repo';
+  const inputMode = useTelegram ? 'Telegram' : useWecom ? 'WeCom' : hasUpstash ? 'Upstash' : 'Repo';
   console.log(`[Loop Agent] Starting...`);
   console.log(`  Key: ${LOOP_KEY}`);
   console.log(`  Provider: ${AI_PROVIDER}, Model: ${AI_MODEL}`);
   console.log(`  Input mode: ${inputMode}`);
   console.log(`  Max runtime: ${MAX_RUNTIME / 1000}s`);
 
-  // Upstash client (optional in Telegram mode)
+  // Upstash client (optional — used for browser polling in all modes)
   const upstash = (UPSTASH_URL && UPSTASH_TOKEN)
     ? new UpstashClient(UPSTASH_URL, UPSTASH_TOKEN)
     : null;
 
-  console.log(`[Main] Upstash client initialization:`);
-  console.log(`  - UPSTASH_URL: ${UPSTASH_URL ? 'present' : '❌ missing'}`);
-  console.log(`  - UPSTASH_TOKEN: ${UPSTASH_TOKEN ? 'present' : '❌ missing'}`);
-  console.log(`  - upstash object: ${upstash ? '✓ created' : '❌ null (missing env variables)'}`);
+  console.log(`[Main] Upstash: ${upstash ? '✓ created' : '❌ null (missing env variables)'}`);
 
   // ── Upstash connectivity test ──
   if (upstash) {
@@ -2658,30 +3710,20 @@ async function main() {
     const outboxKey = `loop:${LOOP_KEY}:outbox`;
     const statusKey = `loop:${LOOP_KEY}:status`;
     console.log(`[Upstash] URL: ${UPSTASH_URL.slice(0, 30)}...`);
-    console.log(`[Upstash] Inbox key:  ${inboxKey}`);
-    console.log(`[Upstash] Outbox key: ${outboxKey}`);
-    console.log(`[Upstash] Status key: ${statusKey}`);
+    console.log(`[Upstash] Keys — inbox: ${inboxKey}, outbox: ${outboxKey}, status: ${statusKey}`);
     try {
-      console.log(`[Upstash] Testing connection with PING...`);
       await upstash.ping();
       console.log(`[Upstash] ✅ Connection verified (PING → PONG)`);
-      // Check if there are any pending messages in the inbox
-      console.log(`[Upstash] Checking for pending messages in inbox...`);
       const pending = await upstash.get(inboxKey);
-      console.log(`[Upstash] Inbox value: ${pending ? `(${typeof pending}) ${JSON.stringify(pending).slice(0, 200)}` : 'empty'}`);
       if (pending) {
         const msg = parseMessage(pending);
         console.log(`[Upstash] Inbox has ${msg ? 'an UNREAD' : 'a read/empty'} message waiting`);
       } else {
-        console.log(`[Upstash] Inbox is empty — waiting for browser messages`);
+        console.log(`[Upstash] Inbox is empty`);
       }
     } catch (e) {
       console.error(`[Upstash] ❌ Connection FAILED: ${e.message}`);
-      console.error(`[Upstash] Error details: ${e.stack ? e.stack.split('\n')[1] : 'no stack'}`);
-      console.error(`[Upstash] Check UPSTASH_URL and UPSTASH_TOKEN in repo secrets`);
-      console.error(`[Upstash] UPSTASH_URL length: ${UPSTASH_URL ? UPSTASH_URL.length : 'undefined'}`);
-      console.error(`[Upstash] UPSTASH_TOKEN length: ${UPSTASH_TOKEN ? UPSTASH_TOKEN.length : 'undefined'}`);
-      if (!useTelegram && hasUpstash && !hasRepoStore) {
+      if (!useTelegram && !useWecom && hasUpstash && !hasRepoStore) {
         console.error(`[FATAL] Upstash is the only messaging channel but connection failed`);
         process.exit(1);
       }
@@ -2717,10 +3759,7 @@ async function main() {
     const tools = createBuiltinTools(repoStore);
     console.log(`[Tools] Registered ${tools.length} tools: ${tools.map(t => t.name).join(', ')}`);
 
-    // Create Checkpointer for persistent state across node transitions
     const checkpointer = new Checkpointer(repoStore, LOOP_HISTORY_PATH);
-
-    // Load persisted state via Checkpointer
     graphState = await checkpointer.load(LOOP_KEY);
 
     agentGraph = new AgentGraph({
@@ -2728,7 +3767,6 @@ async function main() {
       checkpointer, threadId: LOOP_KEY,
     });
 
-    // Restore loaded skills/soul from persisted state
     agentGraph.restoreExtensions(graphState);
 
     console.log(`[Loop Agent] Agent graph created (phase: ${graphState.phase}, turn: ${graphState.turnCount || 0})`);
@@ -2737,13 +3775,24 @@ async function main() {
     }
   } catch (e) {
     console.error(`[FATAL] Failed to create agent graph: ${e.message}`);
-    await sendPushoo(PUSHOO_PLATFORM, PUSHOO_TOKEN_VAL,
+    await sendNotifications(PUSHOO_CHANNELS,
       `[Reply] [Loop Agent] Startup Failed`,
       `Failed to create AI agent: ${e.message}`);
     process.exit(1);
   }
 
-  // Send startup notification (both modes)
+  // ── Shared context (passed to listeners and browser polling) ──
+  const ctx = {
+    agentGraph, graphState, history, repoStore, upstash,
+    loopKey: LOOP_KEY, historyPath: LOOP_HISTORY_PATH,
+    pushooChannels: PUSHOO_CHANNELS,
+    maxRuntime: MAX_RUNTIME, pollInterval: POLL_INTERVAL,
+    aiProvider: AI_PROVIDER, aiModel: AI_MODEL,
+  };
+
+  _runtime.startTime = Date.now();
+
+  // ── Startup notification ──
   const introMsg = [
     `🤖 Loop Agent Started`,
     `Key: ${LOOP_KEY}`,
@@ -2753,63 +3802,54 @@ async function main() {
     SYSTEM_PROMPT ? `System Prompt: ${SYSTEM_PROMPT.slice(0, 200)}${SYSTEM_PROMPT.length > 200 ? '...' : ''}` : '',
   ].filter(Boolean).join('\n');
 
-  if (!useTelegram) {
-    // Upstash mode: send via Pushoo
-    await sendPushoo(PUSHOO_PLATFORM, PUSHOO_TOKEN_VAL, `[Loop Agent] ${LOOP_KEY} Started`, introMsg);
-  }
-
+  // ── Start initial listener ──
   if (useTelegram) {
-    // ── Telegram mode ──
-    const { botToken, chatId } = parseTelegramToken(PUSHOO_TOKEN_VAL);
-    if (!botToken) {
-      console.error('[FATAL] Invalid PUSHOO_TOKEN for Telegram. Expected format: botToken#chatId');
-      process.exit(1);
-    }
-    console.log(`[Telegram] Bot token: ${botToken.slice(0, 10)}...`);
-    console.log(`[Telegram] Chat ID: ${chatId || '(accept all)'}`);
-
+    const { botToken, chatId } = parseTelegramToken(telegramChannel.token);
     // Send intro to Telegram directly
     try {
-      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: introMsg }),
-      });
+      if (chatId) {
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: introMsg }),
+        });
+      }
     } catch (e) {
       console.warn(`[Telegram] Failed to send intro: ${e.message}`);
     }
-
-    await runTelegramMode({
-      botToken, chatId, agentGraph, graphState, history, repoStore, upstash, loopKey: LOOP_KEY,
-      historyPath: LOOP_HISTORY_PATH,
-      maxRuntime: MAX_RUNTIME, pollInterval: POLL_INTERVAL,
-      aiProvider: AI_PROVIDER, aiModel: AI_MODEL,
-    });
-  } else if (hasUpstash) {
-    // ── Upstash mode ──
-    console.log(`  Poll interval: ${POLL_INTERVAL / 1000}s`);
-    console.log(`  Pushoo: ${PUSHOO_PLATFORM || 'disabled'}`);
-
-    await runUpstashMode({
-      upstash, agentGraph, graphState, history, repoStore, loopKey: LOOP_KEY,
-      historyPath: LOOP_HISTORY_PATH,
-      pushooPlatform: PUSHOO_PLATFORM, pushooToken: PUSHOO_TOKEN_VAL,
-      maxRuntime: MAX_RUNTIME, pollInterval: POLL_INTERVAL,
-      aiProvider: AI_PROVIDER, aiModel: AI_MODEL,
-    });
+    _runtime.listener = await createTelegramListener(ctx);
+  } else if (useWecom) {
+    _runtime.listener = await createWecomListener(ctx);
   } else {
-    // ── Repo mode (fallback — no Telegram, no Upstash) ──
-    console.log(`  Poll interval: ${POLL_INTERVAL / 1000}s`);
-    console.log(`  Pushoo: ${PUSHOO_PLATFORM || 'disabled'}`);
-
-    await runRepoMode({
-      agentGraph, graphState, history, repoStore, loopKey: LOOP_KEY,
-      historyPath: LOOP_HISTORY_PATH,
-      pushooPlatform: PUSHOO_PLATFORM, pushooToken: PUSHOO_TOKEN_VAL,
-      maxRuntime: MAX_RUNTIME, pollInterval: POLL_INTERVAL,
-      aiProvider: AI_PROVIDER, aiModel: AI_MODEL,
-    });
+    // Upstash/Repo mode — no bidirectional listener
+    await sendNotifications(PUSHOO_CHANNELS, `[Loop Agent] ${LOOP_KEY} Started`, introMsg);
   }
+
+  // ── Start browser polling (always runs) ──
+  startBrowserPolling(ctx);
+
+  // ── Graceful shutdown ──
+  const shutdown = async (signal) => {
+    console.log(`[Main] ${signal} received, shutting down...`);
+    if (_runtime.pollTimer) clearTimeout(_runtime.pollTimer);
+    if (_runtime.listener) {
+      await _runtime.listener.stop();
+      _runtime.listener = null;
+    }
+    if (signal === 'SIGTERM') {
+      console.log(`[Main] Attempting self-restart...`);
+      const restarted = await selfRestart();
+      console.log(`[Main] Self-restart: ${restarted ? 'dispatched' : 'failed'}`);
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  console.log(`[Loop Agent] ✅ Ready. Listener: ${_runtime.listener ? _runtime.listener.type : 'none'}, Polling: active`);
+
+  // Block forever — event loop is kept alive by Telegraf/WeCom/setTimeout
+  await new Promise(() => {});
 }
 
 main().catch(err => {

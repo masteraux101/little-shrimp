@@ -132,7 +132,7 @@ const GitHubActions = (() => {
     // Always overwrite so the latest workflow template is always in the repo
 
     const yaml = [
-      '# browseragent-workflow: v4-pushoo',
+      '# browseragent-workflow: v5-multichannel',
       'name: Execute Artifact',
       '',
       'on:',
@@ -178,7 +178,7 @@ const GitHubActions = (() => {
       '        run: npm install',
       '',
       '      - name: Install Pushoo for notifications',
-      "        if: env.PUSHOO_PLATFORM != ''",
+      "        if: env.PUSHOO_CHANNELS != ''",
       '        run: npm install -g pushoo',
       '',
       '      - name: Execute',
@@ -202,12 +202,12 @@ const GitHubActions = (() => {
       '          echo "duration=${DURATION}" >> $GITHUB_OUTPUT',
       '          exit $EXIT_CODE',
       '',
-      '      - name: Send Pushoo Notification',
-      '        if: always() && env.PUSHOO_PLATFORM != \'\'',
+      '      - name: Send Notifications',
+      "        if: always() && env.PUSHOO_CHANNELS != ''",
       '        run: |',
       '          npm list pushoo > /dev/null 2>&1 || npm install -g pushoo',
-      '          node << \'PUSHOO_SCRIPT\'',
-      '          const pushoo = require("pushoo").default;',
+      '          node << \'NOTIFY_SCRIPT\'',
+      '          const pushoo = require("pushoo").default || require("pushoo");',
       '          const fs = require("fs");',
       '          const outcome = "${{ steps.run_artifact.outcome }}";',
       '          const success = outcome === "success";',
@@ -221,21 +221,36 @@ const GitHubActions = (() => {
       '          const durationMins = Math.floor(duration / 60);',
       '          const durationSecs = duration % 60;',
       '          (async () => {',
-      '            try {',
-      '              const result = await pushoo(process.env.PUSHOO_PLATFORM, {',
-      '                token: process.env.PUSHOO_TOKEN,',
-      '                title: `GitHub Workflow: ${{ github.workflow }}`,',
-      '                content: `## ${success ? "✅ Workflow Success" : "❌ Workflow Failed"}\\n\\n**Repository**: ${{ github.repository }}\\n**Workflow**: ${{ github.workflow }}\\n**Entrypoint**: ${{ inputs.entrypoint }}\\n**Language**: ${{ inputs.language }}\\n**Duration**: ${durationMins}m ${durationSecs}s\\n**Triggered by**: ${{ github.triggering_actor }}\\n\\n### Output\\n\`\`\`\\n${output}\\n\`\`\`\\n\\n[View Full Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`,',
-      '              });',
-      '              console.log("✅ Pushoo notification sent successfully");',
-      '            } catch (err) {',
-      '              console.warn("⚠️ Pushoo notification failed:", err.message);',
+      '            const channels = JSON.parse(process.env.PUSHOO_CHANNELS || "[]");',
+      '            const title = `GitHub Workflow: ${{ github.workflow }}`;',
+      '            const content = `## ${success ? "✅ Success" : "❌ Failed"}\\n\\n**Repo**: ${{ github.repository }}\\n**Workflow**: ${{ github.workflow }}\\n**Entry**: ${{ inputs.entrypoint }}\\n**Duration**: ${durationMins}m ${durationSecs}s\\n\\n### Output\\n\`\`\`\\n${output}\\n\`\`\`\\n\\n[View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;',
+      '            for (const ch of channels) {',
+      '              try {',
+      '                if (ch.platform === "telegram") {',
+      '                  const sep = ch.token.includes("#") ? "#" : "/";',
+      '                  const [botToken, chatId] = ch.token.split(sep);',
+      '                  if (botToken && chatId) {',
+      '                    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {',
+      "                      method: 'POST',",
+      "                      headers: { 'Content-Type': 'application/json' },",
+      '                      body: JSON.stringify({ chat_id: chatId, text: title + "\\n\\n" + output.slice(0, 3000) }),',
+      '                    });',
+      '                    console.log("Telegram notification sent");',
+      '                  }',
+      '                } else if (ch.platform === "wecombot") {',
+      '                  console.log("WeCom Bot: skipped in workflow (bidirectional only)");',
+      '                } else {',
+      '                  await pushoo(ch.platform, { token: ch.token, title, content });',
+      '                  console.log(`${ch.platform} notification sent`);',
+      '                }',
+      '              } catch (err) {',
+      '                console.warn(`${ch.platform} notification failed:`, err.message);',
+      '              }',
       '            }',
       '          })();',
-      '          PUSHOO_SCRIPT',
+      '          NOTIFY_SCRIPT',
       '        env:',
-      '          PUSHOO_PLATFORM: ${{ secrets.PUSHOO_PLATFORM || "" }}',
-      '          PUSHOO_TOKEN: ${{ secrets.PUSHOO_TOKEN || "" }}',
+      '          PUSHOO_CHANNELS: ${{ secrets.PUSHOO_CHANNELS || "[]" }}',
       '',
     ].join('\n');
 
@@ -258,15 +273,12 @@ const GitHubActions = (() => {
    * @param {string} opts.scriptFilename - e.g. 'daily-report.py'
    * @param {string} opts.language       - 'python' | 'node' | 'bash'
    * @param {string} opts.artifactDir    - e.g. 'artifacts'
-   * @param {boolean} opts.emailNotify   - Whether to include email step
-   * @param {boolean} opts.pushooNotify  - Whether to include pushoo step
    * @returns {string} The workflow YAML content
    */
   function generateScheduleWorkflow(opts) {
     const {
       name, slug, cron, scheduleText,
       scriptFilename, language, artifactDir = 'artifacts',
-      emailNotify = false,
     } = opts;
 
     const entrypoint = `${artifactDir}/${scriptFilename}`;
@@ -327,78 +339,50 @@ const GitHubActions = (() => {
       `          ${runCmd} ${entrypoint} 2>&1 | tee /tmp/task_output.txt`,
     );
 
-    // Email notification step
-    if (emailNotify) {
-      lines.push(
-        '',
-        '      - name: Send email notification',
-        '        if: always()',
-        '        env:',
-        '          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}',
-        '          NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL }}',
-        '        run: |',
-        '          OUTCOME="${{ steps.run_task.outcome }}"',
-        '          python3 -c "',
-        '          import json, sys',
-        "          content = open('/tmp/task_output.txt').read()",
-        `          html = '<pre style=\\"font-family:monospace;white-space:pre-wrap\\">' + content + '</pre>'`,
-        '          payload = json.dumps({',
-        "            'from': 'BrowserAgent <onboarding@resend.dev>',",
-        "            'to': ['$NOTIFY_EMAIL'],",
-        `            'subject': '[BrowserAgent] ${slug} — $OUTCOME',`,
-        "            'html': html",
-        '          })',
-        '          sys.stdout.write(payload)',
-        '          " > /tmp/email_payload.json',
-        '          curl -s -X POST https://api.resend.com/emails \\',
-        '            -H "Authorization: Bearer $RESEND_API_KEY" \\',
-        '            -H "Content-Type: application/json" \\',
-        '            -d @/tmp/email_payload.json',
-      );
-    }
-
-    // Pushoo notification step — always included, runtime-guarded by PUSHOO_PLATFORM
+    // Pushoo multi-channel notification step — guarded by PUSHOO_CHANNELS
     lines.push(
       '',
-      '      - name: Send Pushoo notification',
-      "        if: always() && env.PUSHOO_PLATFORM != ''",
+      '      - name: Send notifications',
+      "        if: always() && env.PUSHOO_CHANNELS != ''",
       '        env:',
-      "          PUSHOO_PLATFORM: ${{ secrets.PUSHOO_PLATFORM }}",
-      "          PUSHOO_TOKEN: ${{ secrets.PUSHOO_TOKEN }}",
+      "          PUSHOO_CHANNELS: ${{ secrets.PUSHOO_CHANNELS }}",
       '          OUTCOME: ${{ steps.run_task.outcome }}',
       '        run: |',
       '          npm install pushoo 2>/dev/null || true',
       '          export CONTENT=$(cat /tmp/task_output.txt | head -c 800 || echo "(no output)")',
-      '          node << \'PUSHOO_SCRIPT\'',
+      '          node << \'NOTIFY_SCRIPT\'',
       "          const pushoo = require('pushoo').default || require('pushoo');",
       '          (async () => {',
-      '            try {',
-      '              const outcome = process.env.OUTCOME || "unknown";',
-      '              const content = process.env.CONTENT || "(no output)";',
-      '              const platform = process.env.PUSHOO_PLATFORM || "webhook";',
-      '              const token = process.env.PUSHOO_TOKEN;',
-      '              ',
-      '              // For webhook platform, token contains the full URL',
-      '              // Pushoo supports using the URL directly as the platform parameter',
-      '              if (platform === "webhook" && token.startsWith("http")) {',
-      '                await pushoo(token, {',
-      `                  title: "[BrowserAgent] ${slug} — " + outcome,`,
-      '                  content: "## Status: " + outcome + "\\n\\n```\\n" + content + "\\n```"',
-      '                });',
-      '              } else {',
-      '                // Standard platform with token',
-      '                await pushoo(platform, {',
-      '                  token: token,',
-      `                  title: "[BrowserAgent] ${slug} — " + outcome,`,
-      '                  content: "## Status: " + outcome + "\\n\\n```\\n" + content + "\\n```"',
-      '                });',
+      '            const channels = JSON.parse(process.env.PUSHOO_CHANNELS || "[]");',
+      '            const outcome = process.env.OUTCOME || "unknown";',
+      '            const content = process.env.CONTENT || "(no output)";',
+      `            const title = "[BrowserAgent] ${slug} — " + outcome;`,
+      '            const body = "## Status: " + outcome + "\\n\\n```\\n" + content + "\\n```";',
+      '            for (const ch of channels) {',
+      '              try {',
+      '                if (ch.platform === "telegram") {',
+      '                  const sep = ch.token.includes("#") ? "#" : "/";',
+      '                  const [botToken, chatId] = ch.token.split(sep);',
+      '                  if (botToken && chatId) {',
+      '                    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {',
+      "                      method: 'POST',",
+      "                      headers: { 'Content-Type': 'application/json' },",
+      '                      body: JSON.stringify({ chat_id: chatId, text: title + "\\n\\n" + content }),',
+      '                    });',
+      '                    console.log("Telegram notification sent");',
+      '                  }',
+      '                } else if (ch.platform === "wecombot") {',
+      '                  console.log("WeCom Bot: skipped (bidirectional only)");',
+      '                } else {',
+      '                  await pushoo(ch.platform, { token: ch.token, title, content: body });',
+      '                  console.log(`${ch.platform} notification sent`);',
+      '                }',
+      '              } catch (e) {',
+      '                console.warn(`${ch.platform} notification failed:`, e.message);',
       '              }',
-      "              console.log('Pushoo notification sent');",
-      '            } catch (e) {',
-      "              console.warn('Pushoo failed:', e.message);",
       '            }',
       '          })();',
-      '          PUSHOO_SCRIPT',
+      '          NOTIFY_SCRIPT',
     );
 
     return lines.join('\n') + '\n';
@@ -784,7 +768,7 @@ const GitHubActions = (() => {
   /**
    * Create or update a repository Actions variable.
    * @param {Object} config - { token, owner, repo }
-   * @param {string} varName - e.g. 'NOTIFY_EMAIL'
+   * @param {string} varName - e.g. 'MY_VARIABLE'
    * @param {string} varValue - the value
    */
   async function setRepoVariable(config, varName, varValue) {
@@ -829,7 +813,7 @@ const GitHubActions = (() => {
    * Sync all required secrets and variables for scheduled tasks.
    * Reads values from the provided settings map and pushes to the repo.
    * @param {Object} config - { token, owner, repo }
-   * @param {Object} settings - { geminiApiKey?, qwenApiKey?, resendApiKey?, notifyEmail? }
+   * @param {Object} settings - { geminiApiKey?, qwenApiKey?, PUSHOO_CHANNELS? }
    * @returns {Object} { synced: string[], skipped: string[], errors: string[] }
    */
   async function syncSecretsAndVars(config, settings) {
@@ -841,9 +825,7 @@ const GitHubActions = (() => {
     const secrets = [
       { name: 'GEMINI_API_KEY', value: settings.geminiApiKey },
       { name: 'QWEN_API_KEY', value: settings.qwenApiKey },
-      { name: 'RESEND_API_KEY', value: settings.resendApiKey },
-      { name: 'PUSHOO_PLATFORM', value: settings.PUSHOO_PLATFORM },
-      { name: 'PUSHOO_TOKEN', value: settings.PUSHOO_TOKEN },
+      { name: 'PUSHOO_CHANNELS', value: settings.PUSHOO_CHANNELS },
     ];
 
     for (const s of secrets) {
@@ -857,18 +839,6 @@ const GitHubActions = (() => {
       } catch (e) {
         errors.push(`${s.name}: ${e.message}`);
       }
-    }
-
-    // Variables
-    if (settings.notifyEmail) {
-      try {
-        await setRepoVariable(config, 'NOTIFY_EMAIL', settings.notifyEmail);
-        synced.push('NOTIFY_EMAIL');
-      } catch (e) {
-        errors.push(`NOTIFY_EMAIL: ${e.message}`);
-      }
-    } else {
-      skipped.push('NOTIFY_EMAIL');
     }
 
     return { synced, skipped, errors };
@@ -942,6 +912,23 @@ const GitHubActions = (() => {
     }
   }
 
+  /**
+   * Cancel a workflow run via the GitHub Actions API.
+   * @param {Object} config - { token, owner, repo }
+   * @param {number} runId - The workflow run ID to cancel
+   */
+  async function cancelRun(config, runId) {
+    const { token, owner, repo } = config;
+    const resp = await fetch(
+      `${API}/repos/${owner}/${repo}/actions/runs/${runId}/cancel`,
+      { method: 'POST', headers: hdrs(token) }
+    );
+    if (!resp.ok && resp.status !== 202) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.message || `Cancel run failed: ${resp.status}`);
+    }
+  }
+
   // ─── Public API ────────────────────────────────────────────────────
 
   return {
@@ -966,6 +953,7 @@ const GitHubActions = (() => {
     listWorkflows,
     listRecentRuns,
     deleteFile,
+    cancelRun,
   };
 })();
 

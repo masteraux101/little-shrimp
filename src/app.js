@@ -49,6 +49,168 @@ const App = (() => {
     }
   }
 
+  // ─── Loop Agent Status Panel ───────────────────────────────────────
+  let _loopStatusPanelVisible = false;
+
+  function showLoopStatusPanel() {
+    const panel = document.getElementById('loop-status-panel');
+    if (panel) {
+      panel.classList.remove('hidden');
+      panel.style.display = 'block';
+      _loopStatusPanelVisible = true;
+    }
+  }
+
+  function hideLoopStatusPanel() {
+    const panel = document.getElementById('loop-status-panel');
+    if (panel) {
+      panel.classList.add('hidden');
+      panel.style.display = 'none';
+      _loopStatusPanelVisible = false;
+    }
+  }
+
+  async function refreshLoopStatusPanel() {
+    if (!currentSessionId) return;
+    const cfg = getSessionConfig(currentSessionId);
+    const loopKeys = cfg.loopKeys || [];
+    const contentEl = document.getElementById('loop-status-content');
+    if (!contentEl) return;
+
+    if (loopKeys.length === 0) {
+      contentEl.innerHTML = '<span style="opacity:.6">No loop agents deployed in this session.</span>';
+      return;
+    }
+
+    contentEl.innerHTML = '<span style="opacity:.6">Refreshing…</span>';
+
+    let config;
+    try { config = getActionConfig(); }
+    catch (e) {
+      contentEl.innerHTML = `<span style="color:#e74c3c;">⚠️ ${escapeHtml(e.message)}</span>`;
+      return;
+    }
+
+    try {
+      const recentRuns = await GitHubActions.listRecentRuns(config, null, 30);
+
+      // Build active channel info
+      const pushooConfig = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
+      const channelSummary = PushooNotifier.getChannelSummary(pushooConfig) || 'None';
+      const upstashUrl = cfg.upstashUrl || getSessionSetting('upstashUrl');
+
+      const items = [];
+      for (const key of loopKeys) {
+        const run = recentRuns.find(r => r.name && r.name.includes(key));
+        const isRunning = run && (run.status === 'in_progress' || run.status === 'queued');
+        const stateIcon = !run ? '⚪' : isRunning ? '🟢' : run.conclusion === 'success' ? '✅' : '🔴';
+        const connected = _loopConnectedKey === key;
+
+        items.push(`
+          <div style="background:rgba(255,255,255,.05);border-radius:6px;padding:6px 10px;min-width:200px;position:relative;" data-loop-key="${escapeHtml(key)}" data-run-id="${run ? run.id : ''}" data-is-running="${isRunning ? '1' : '0'}">
+            <button class="loop-card-close" data-key="${escapeHtml(key)}" style="position:absolute;top:4px;right:6px;background:none;border:none;color:#e74c3c;cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;opacity:.7;" title="${isRunning ? 'Stop & remove' : 'Remove'}">&times;</button>
+            <div style="font-weight:600;margin-bottom:2px;padding-right:20px;">${stateIcon} ${escapeHtml(key)} ${connected ? '<span style="color:#4ae168;font-size:10px;">● connected</span>' : ''}</div>
+            <div style="opacity:.7;">Channel: ${escapeHtml(channelSummary)}</div>
+            ${upstashUrl ? '<div style="opacity:.7;">Upstash: ✓ configured</div>' : ''}
+            ${run ? `<div style="margin-top:4px;"><a href="${run.html_url}" target="_blank" style="color:#8ec5fc;font-size:11px;">View Run →</a></div>` : ''}
+            <div style="margin-top:6px;"><button class="loop-card-connect" data-key="${escapeHtml(key)}" style="background:#22863a;color:#fff;border:none;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;">${connected ? '✓ Connected' : 'Connect'}</button></div>
+          </div>
+        `);
+      }
+      contentEl.innerHTML = items.join('');
+
+      // Wire X (close) buttons
+      contentEl.querySelectorAll('.loop-card-close').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const key = btn.dataset.key;
+          const card = btn.closest('[data-loop-key]');
+          const runId = card?.dataset.runId;
+          const running = card?.dataset.isRunning === '1';
+
+          if (running && runId) {
+            if (!confirm(`Loop agent "${key}" is still running. Stop and remove it?`)) return;
+            btn.textContent = '⏳';
+            try {
+              await GitHubActions.cancelRun(config, runId);
+            } catch (err) {
+              showToast(`Failed to cancel run: ${err.message}`, 'error');
+            }
+          }
+
+          // If connected to this key, disconnect first
+          if (_loopConnectedKey === key) disconnectLoopAgent();
+
+          // Clean up Upstash keys
+          const cfgClean = getSessionConfig(currentSessionId);
+          await LoopAgent.cleanupUpstashKeys(key, {
+            upstashUrl: cfgClean.upstashUrl || getSessionSetting('upstashUrl') || '',
+            upstashToken: cfgClean.upstashToken || getSessionSetting('upstashToken') || '',
+          });
+
+          // Remove key from session config
+          const cfgDel = getSessionConfig(currentSessionId);
+          cfgDel.loopKeys = (cfgDel.loopKeys || []).filter(k => k !== key);
+          if (cfgDel.loopEncrypted) delete cfgDel.loopEncrypted[key];
+          saveSessionConfig(currentSessionId, cfgDel);
+
+          // Remove card from DOM
+          card?.remove();
+
+          // If no more keys, show empty message
+          if ((cfgDel.loopKeys || []).length === 0) {
+            contentEl.innerHTML = '<span style="opacity:.6">No loop agents deployed in this session.</span>';
+          }
+        });
+      });
+
+      // Wire Connect buttons
+      contentEl.querySelectorAll('.loop-card-connect').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const key = btn.dataset.key;
+          const input = document.getElementById('message-input');
+          if (input) {
+            input.value = `/loop connect ${key}`;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          // Trigger sendMessage
+          document.getElementById('send-btn')?.click();
+        });
+      });
+    } catch (e) {
+      contentEl.innerHTML = `<span style="color:#e74c3c;">Failed to fetch status: ${escapeHtml(e.message)}</span>`;
+    }
+  }
+
+  /**
+   * Check what prerequisites are missing for deploying a Loop Agent.
+   * Returns { ready: bool, missing: string[] }
+   */
+  function checkLoopPrerequisites() {
+    const missing = [];
+
+    // Check GitHub Actions config
+    try { getActionConfig(); }
+    catch { missing.push('github_actions'); }
+
+    // Check messaging channel
+    const pushooConfig = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
+    const hasTelegram = pushooConfig.channels.some(ch => ch.platform === 'telegram' && ch.token);
+    const hasWecom = pushooConfig.channels.some(ch => ch.platform === 'wecombot' && ch.token);
+    if (!hasTelegram && !hasWecom) missing.push('messaging_channel');
+
+    // Check AI provider and API key
+    const provider = getSessionSetting('provider') || inferProviderFromModel(getSessionSetting('model'));
+    const model = getSessionSetting('model');
+    const apiKey = provider === 'qwen' ? getSessionSetting('qwenApiKey')
+      : provider === 'kimi' ? getSessionSetting('kimiApiKey')
+      : getSessionSetting('apiKey');
+    if (!apiKey) missing.push('api_key');
+    if (!model) missing.push('model');
+
+    return { ready: missing.length === 0, missing };
+  }
+
   // ─── Built-in Catalog ──────────────────────────────────────────────
   // Cached catalog entries loaded from bundled examples/ directory.
   // Each entry: { name, file, icon, description }
@@ -117,11 +279,11 @@ const App = (() => {
   const SESSION_CFG_PREFIX = 'browseragent_session_cfg_';
 
   // Keys that are per-session (each session stores its own independent copy)
-  const SESSION_KEYS = ['apiKey', 'qwenApiKey', 'kimiApiKey', 'provider', 'model', 'enableSearch', 'enableThinking', 'thinkingBudget', 'includeThoughts', 'soulUrl', 'notionToken', 'corsProxy', 'storageBackend', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionUseStorage', 'actionBranch', 'actionWorkflow', 'actionArtifactDir', 'actionToken', 'actionOwner', 'actionRepo', 'resendApiKey', 'notifyEmail', 'pushooConfig', 'upstashUrl', 'upstashToken'];
+  const SESSION_KEYS = ['apiKey', 'qwenApiKey', 'kimiApiKey', 'provider', 'model', 'enableSearch', 'enableThinking', 'thinkingBudget', 'includeThoughts', 'soulUrl', 'notionToken', 'corsProxy', 'storageBackend', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionUseStorage', 'actionBranch', 'actionWorkflow', 'actionArtifactDir', 'actionToken', 'actionOwner', 'actionRepo', 'pushooConfig', 'upstashUrl', 'upstashToken'];
 
   // Credential-type keys where empty string should be treated as "not set"
   // so the ?? / fallback logic can reach the next level (global settings).
-  const CREDENTIAL_KEYS = new Set(['apiKey', 'qwenApiKey', 'kimiApiKey', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionToken', 'actionOwner', 'actionRepo', 'resendApiKey', 'notifyEmail', 'notionToken', 'pushooConfig', 'upstashUrl', 'upstashToken']);
+  const CREDENTIAL_KEYS = new Set(['apiKey', 'qwenApiKey', 'kimiApiKey', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionToken', 'actionOwner', 'actionRepo', 'notionToken', 'pushooConfig', 'upstashUrl', 'upstashToken']);
 
   /**
    * Read a value from a config object with fallback, treating empty strings
@@ -369,12 +531,6 @@ const App = (() => {
       quickSouls.title = tl('quickSouls');
     }
 
-    const quickSchedule = $('#quick-btn-schedule');
-    if (quickSchedule) {
-      quickSchedule.innerHTML = `⏰ ${tl('quickSchedule')}`;
-      quickSchedule.title = tl('quickSchedule');
-    }
-
     const quickCompact = $('#quick-btn-compact');
     if (quickCompact) {
       quickCompact.innerHTML = `📦 ${tl('quickCompact')}`;
@@ -500,14 +656,6 @@ const App = (() => {
     setText('#pushoo-config-btn', `⚙️ ${tl('configPushoo')}`);
     const pushooHint = $('#pushoo-config-btn')?.parentElement?.querySelector('.hint');
     if (pushooHint) pushooHint.childNodes[0].textContent = `${tl('pushooHint')} — `;
-    const collapsibleEmail = document.querySelector('#settings-section-notify .collapsible-header span:last-child');
-    if (collapsibleEmail) collapsibleEmail.textContent = tl('emailNotifyResend');
-    setText('label[for="set-resend-api-key"]', tl('resendApiKey'));
-    const resendHint = $('#set-resend-api-key')?.parentElement?.parentElement?.querySelector('.hint');
-    if (resendHint) resendHint.childNodes[0].textContent = `${tl('resendHint')} `;
-    setText('label[for="set-notify-email"]', tl('defaultNotifyEmail'));
-    const notifyEmailHint = $('#set-notify-email')?.parentElement?.querySelector('.hint');
-    if (notifyEmailHint) notifyEmailHint.textContent = tl('notifyEmailHint');
 
     setText('#reload-soul-btn', `↻ ${tl('reloadSoul')}`);
     const applyBtn = $('#apply-settings');
@@ -1188,6 +1336,8 @@ const App = (() => {
       { cmd: '/loop status',    desc: tl('slashLoopStatusDesc') },
       { cmd: '/loop connect',   desc: tl('slashLoopConnectDesc') },
       { cmd: '/loop disconnect', desc: tl('slashLoopDisconnectDesc') },
+      { cmd: '/loop channel',  desc: tl('slashLoopChannelDesc') },
+      { cmd: '/loop dashboard', desc: tl('slashLoopDashboardDesc') },
       { cmd: '/loop memory clear', desc: 'Clear the loop agent persistent memory file' },
       { cmd: '/skills',         desc: tl('slashSkillsDesc') },
       { cmd: '/soul',           desc: tl('slashSoulDesc') },
@@ -1665,11 +1815,9 @@ const App = (() => {
       const defaultScript = foundArtifacts[0];
       const defaultSlug = defaultScript.filename.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
 
-      const hasResend = !!getSessionSetting('resendApiKey');
-      const hasNotifyEmail = !!getSessionSetting('notifyEmail');
-      const canEmail = hasResend && hasNotifyEmail;
       const pushooConfig = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
-      const hasPushoo = !!(pushooConfig.platform && pushooConfig.token);
+      const hasPushoo = PushooNotifier.hasChannels(pushooConfig);
+      const channelSummary = hasPushoo ? PushooNotifier.getChannelSummary(pushooConfig, currentLang) : '';
 
       const artifactOptions = foundArtifacts.map((a, i) =>
         `<option value="${i}" ${i === 0 ? 'selected' : ''}>${escapeHtml(a.filename)} (${a.language})</option>`
@@ -1699,13 +1847,9 @@ const App = (() => {
 
           <label class="schedule-field-label">${tl('notifyTitle')}</label>
           <div class="schedule-notify-row">
-            <label class="schedule-checkbox-label">
-              <input type="checkbox" id="schedule-email" ${canEmail ? 'checked' : 'disabled'}>
-              📧 ${tl('msgEmail')} ${canEmail ? '' : `<span class="schedule-hint">(${tl('msgConfigureResendInSettings')})</span>`}
-            </label>
             <div class="schedule-checkbox-label" style="opacity:${hasPushoo ? 1 : 0.5}">
-              📢 Pushoo ${hasPushoo
-                ? '<span class="schedule-hint" style="color:#22863a">✅ ' + tl('msgAutoNotifyVia') + ' ' + escapeHtml(pushooConfig.platform) + '</span>'
+              📢 ${hasPushoo
+                ? '<span class="schedule-hint" style="color:#22863a">✅ ' + tl('msgAutoNotifyVia') + ' ' + escapeHtml(channelSummary) + '</span>'
                 : `<span class="schedule-hint">(${tl('msgConfigurePushooInSettings')})</span>`}
             </div>
           </div>
@@ -1791,7 +1935,6 @@ const App = (() => {
         const scriptIdx = parseInt(bubble.querySelector('#schedule-script').value);
         const script = foundArtifacts[scriptIdx];
         const slug = nameInput.value.trim().replace(/[^a-z0-9-]/gi, '-').toLowerCase() || 'task';
-        const emailChecked = bubble.querySelector('#schedule-email').checked;
 
         const wfFileName = `scheduler-${slug}.yml`;
         const wfPath = `.github/workflows/${wfFileName}`;
@@ -1806,7 +1949,6 @@ const App = (() => {
             scriptFilename: script.filename,
             language: script.language,
             artifactDir: config.artifactDir,
-            emailNotify: emailChecked,
           });
 
           // Prepare files for atomic push
@@ -1827,15 +1969,12 @@ const App = (() => {
           const settings = {
             geminiApiKey: getSessionSetting('apiKey'),
             qwenApiKey: getSessionSetting('qwenApiKey'),
-            resendApiKey: emailChecked ? getSessionSetting('resendApiKey') : undefined,
-            notifyEmail: emailChecked ? getSessionSetting('notifyEmail') : undefined,
           };
 
-          // Always sync Pushoo secrets when configured (workflow always has the Pushoo step)
+          // Sync all notification channels as PUSHOO_CHANNELS JSON
           const pc = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
-          if (pc.platform && pc.token) {
-            settings.PUSHOO_PLATFORM = pc.platform;
-            settings.PUSHOO_TOKEN = pc.token;
+          if (pc.channels.length > 0) {
+            settings.PUSHOO_CHANNELS = JSON.stringify(pc.channels);
           }
 
           const result = await GitHubActions.syncSecretsAndVars(config, settings);
@@ -2120,6 +2259,10 @@ const App = (() => {
     if (cmd === '/loop status') {
       addMessageBubble('user', '/loop status');
 
+      // Show the status panel
+      showLoopStatusPanel();
+      refreshLoopStatusPanel();
+
       const cfg = getSessionConfig(currentSessionId);
       const loopKeys = cfg.loopKeys || [];
       if (loopKeys.length === 0) {
@@ -2322,6 +2465,142 @@ const App = (() => {
       return true;
     }
 
+    // ─── /loop channel — Switch to a specific notification channel ────
+    if (cmd.startsWith('/loop channel')) {
+      addMessageBubble('user', text.trim());
+      if (!_loopConnectedKey) {
+        addMessageBubble('model', `⚠️ Not connected to a loop agent. Use \`/loop connect <key>\` first.`);
+        return true;
+      }
+
+      // Get available channels
+      const freshPushoo = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
+      if (freshPushoo.channels.length === 0) {
+        addMessageBubble('model', `⚠️ No notification channels configured. Open **Settings** → **Notifications** to add channels.`);
+        return true;
+      }
+
+      let config;
+      try { config = getActionConfig(); }
+      catch (e) { addMessageBubble('model', `⚠️ ${e.message}`); return true; }
+
+      const cfg = getSessionConfig(currentSessionId);
+      const platformArg = text.trim().slice('/loop channel'.length).trim().toLowerCase();
+
+      // Helper function to switch to a specific channel
+      const switchToChannel = async (selectedChannels) => {
+        const channelsJson = JSON.stringify(selectedChannels);
+        const controlMsg = `__SWITCH_CHANNEL__:${channelsJson}`;
+        try {
+          await LoopAgent.sendIntervention(config, _loopConnectedKey, controlMsg, {
+            upstashUrl: cfg.upstashUrl || '',
+            upstashToken: cfg.upstashToken || '',
+            encryptKey: _loopEncryptKey || '',
+          });
+          const summary = PushooNotifier.getChannelSummary({ channels: selectedChannels });
+          return { success: true, summary };
+        } catch (e) {
+          return { success: false, error: e.message };
+        }
+      };
+
+      // If platform is specified via command, switch directly
+      if (platformArg) {
+        const selectedChannel = freshPushoo.channels.find(ch => ch.platform === platformArg);
+        if (!selectedChannel) {
+          addMessageBubble('model', `⚠️ Channel "${escapeHtml(platformArg)}" not configured.\n\nAvailable: ${freshPushoo.channels.map(ch => `\`${ch.platform}\``).join(', ')}`);
+          return true;
+        }
+
+        const bubble = addMessageBubble('model', `⏳ Switching to **${escapeHtml(platformArg)}**…`);
+        (async () => {
+          const result = await switchToChannel([selectedChannel]);
+          if (result.success) {
+            bubble.innerHTML = renderMarkdown(`✅ Switched to **${escapeHtml(platformArg)}**`);
+          } else {
+            bubble.innerHTML = renderMarkdown(`❌ Failed to switch: ${result.error}`);
+          }
+        })();
+        return true;
+      }
+
+      // No platform specified: show interactive channel selector buttons
+      const panelId = 'ch-sel-' + Date.now();
+      const ICONS = { telegram: '✈️', wecombot: '💼', discord: '💬', dingtalk: '🔔', feishu: '🐦', webhook: '🔗' };
+      const bubble = addMessageBubble('model', '');
+      bubble.innerHTML = [
+        `<div id="${panelId}" style="padding:12px;">`,
+        `<div style="margin-bottom:10px;font-weight:600;">📡 Switch notification channel for <strong>${escapeHtml(_loopConnectedKey)}</strong>:</div>`,
+        `<div style="display:flex;flex-wrap:wrap;gap:8px;">`,
+        ...freshPushoo.channels.map(ch => {
+          const icon = ICONS[ch.platform] || '📨';
+          return `<button data-platform="${escapeHtml(ch.platform)}" style="display:inline-flex;align-items:center;gap:6px;padding:8px 16px;background:#fff;border:1px solid #d0d7de;border-radius:8px;cursor:pointer;font-size:14px;transition:all .15s;">${icon} ${escapeHtml(ch.platform)}</button>`;
+        }),
+        `</div>`,
+        `<div class="ch-result" style="margin-top:10px;"></div>`,
+        `</div>`
+      ].join('');
+
+      // Scoped event delegation on this panel only
+      const panel = document.getElementById(panelId);
+      if (panel) {
+        let switching = false;
+        panel.addEventListener('click', async (e) => {
+          const btn = e.target.closest('button[data-platform]');
+          if (!btn || switching) return;
+          const platform = btn.dataset.platform;
+          const selectedChannel = freshPushoo.channels.find(ch => ch.platform === platform);
+          if (!selectedChannel) return;
+
+          // Disable all buttons & show loading
+          switching = true;
+          const buttons = panel.querySelectorAll('button[data-platform]');
+          buttons.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; b.style.cursor = 'wait'; });
+          btn.style.opacity = '1';
+          btn.style.borderColor = '#0969da';
+          btn.style.background = '#ddf4ff';
+          const resultDiv = panel.querySelector('.ch-result');
+          resultDiv.innerHTML = `<span style="color:#656d76;">⏳ Switching to <strong>${escapeHtml(platform)}</strong>…</span>`;
+
+          const result = await switchToChannel([selectedChannel]);
+
+          if (result.success) {
+            resultDiv.innerHTML = `<span style="color:#1a7f37;">✅ Switched to <strong>${escapeHtml(platform)}</strong></span>`;
+            // Keep selected button highlighted, restore others
+            buttons.forEach(b => {
+              b.disabled = false;
+              b.style.cursor = 'pointer';
+              if (b === btn) {
+                b.style.opacity = '1'; b.style.borderColor = '#0969da'; b.style.background = '#ddf4ff';
+              } else {
+                b.style.opacity = '1'; b.style.borderColor = '#d0d7de'; b.style.background = '#fff';
+              }
+            });
+          } else {
+            resultDiv.innerHTML = `<span style="color:#cf222e;">❌ Failed: ${escapeHtml(result.error)}</span>`;
+            buttons.forEach(b => { b.disabled = false; b.style.opacity = '1'; b.style.cursor = 'pointer'; b.style.borderColor = '#d0d7de'; b.style.background = '#fff'; });
+          }
+          switching = false;
+        });
+      }
+      scrollToBottom();
+      return true;
+    }
+
+    // ─── /loop dashboard — Show/hide the Loop Agent status panel ──────
+    if (cmd === '/loop dashboard') {
+      addMessageBubble('user', '/loop dashboard');
+      if (_loopStatusPanelVisible) {
+        hideLoopStatusPanel();
+        addMessageBubble('model', `Dashboard panel hidden.`);
+      } else {
+        showLoopStatusPanel();
+        refreshLoopStatusPanel();
+        addMessageBubble('model', `Dashboard panel shown. Use the ↻ button to refresh.`);
+      }
+      return true;
+    }
+
     // ─── /loop disconnect — Disconnect from the loop agent ────────────
     if (cmd === '/loop disconnect') {
       addMessageBubble('user', '/loop disconnect');
@@ -2338,7 +2617,25 @@ const App = (() => {
     if (cmd === '/loop') {
       addMessageBubble('user', '/loop');
 
-      // Validate requirements
+      // Check prerequisites and guide user if missing
+      const prereqs = checkLoopPrerequisites();
+      if (!prereqs.ready) {
+        const steps = [];
+        let stepNum = 1;
+        if (prereqs.missing.includes('github_actions')) {
+          steps.push(`**${stepNum++}. Configure GitHub Actions Repository**\nOpen **Settings** (⚙) → **GitHub Actions Execution** and enter your GitHub token, repo owner, and repo name. Or use **Encrypted Session Storage** → GitHub and enable "Use session storage repository".`);
+        }
+        if (prereqs.missing.includes('api_key') || prereqs.missing.includes('model')) {
+          steps.push(`**${stepNum++}. Configure AI Model**\nOpen **Settings** (⚙) → **AI Configuration** and select a provider, model, and enter the API key.`);
+        }
+        if (prereqs.missing.includes('messaging_channel')) {
+          steps.push(`**${stepNum++}. Configure a Messaging Channel**\nLoop Agent requires a bidirectional channel (Telegram or WeCom Bot). Open **Settings** (⚙) → **Notifications** → **Configure Channels** and add a Telegram or WeCom Bot channel.\n\n> For Telegram: create a bot via @BotFather, get the token, then send a message to the bot and use \`botToken#chatId\` format.`);
+        }
+        const guideHtml = `## 🔄 Loop Agent Setup Guide\n\nSome prerequisites are missing before you can deploy a Loop Agent. Please complete these steps:\n\n${steps.join('\n\n')}\n\n---\n_After completing the setup, run \`/loop\` again to deploy._`;
+        addMessageBubble('model', guideHtml);
+        return true;
+      }
+
       let config;
       try {
         config = getActionConfig();
@@ -2347,13 +2644,10 @@ const App = (() => {
         return true;
       }
 
-      // Require a bidirectional messaging channel (e.g. Telegram) via Pushoo
+      // Require a bidirectional messaging channel (Telegram via Pushoo or WeCom Bot)
       const pushooConfig = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
-      const hasPushoo = !!(pushooConfig.platform && pushooConfig.token);
-      if (!hasPushoo) {
-        addMessageBubble('model', `⚠️ ${tl('msgMessagingChannelRequired')}`);
-        return true;
-      }
+      const hasTelegram = pushooConfig.channels.some(ch => ch.platform === 'telegram' && ch.token);
+      const hasWecom = pushooConfig.channels.some(ch => ch.platform === 'wecombot' && ch.token);
 
       const provider = getSessionSetting('provider') || inferProviderFromModel(getSessionSetting('model'));
       const model = getSessionSetting('model');
@@ -2376,7 +2670,7 @@ const App = (() => {
 
           <label class="schedule-field-label">${tl('msgLoopKey')}</label>
           <input id="loop-key-input" class="schedule-input" type="text" value="${escapeHtml(loopKey)}" readonly style="font-family:monospace;background:var(--bg-darker,#111);cursor:text;" />
-          <div class="hint" style="margin-top:2px;">This key identifies the agent. Messages are delivered via ${escapeHtml(pushooConfig.platform)}.</div>
+          <div class="hint" style="margin-top:2px;">This key identifies the agent. Messages are delivered via ${hasWecom ? 'WeCom Bot' : hasTelegram ? 'Telegram' : 'configured channels'}.</div>
 
           <label class="schedule-field-label">${tl('msgLoopSystemPrompt')}</label>
           <textarea id="loop-system-prompt" class="schedule-input" rows="3" placeholder="Optional: custom system prompt for the agent..."
@@ -2404,7 +2698,7 @@ const App = (() => {
 
           <div class="schedule-notify-row" style="margin-top:10px;">
             <div class="schedule-checkbox-label">
-              📢 <span class="schedule-hint" style="color:#22863a">✅ ${tl('msgAutoNotifyVia')} ${escapeHtml(pushooConfig.platform)}</span>
+              📢 <span class="schedule-hint" style="color:#22863a">✅ ${tl('msgAutoNotifyVia')} ${PushooNotifier.getChannelSummary(pushooConfig)}</span>
             </div>
           </div>
 
@@ -2450,11 +2744,7 @@ const App = (() => {
           const freshPushoo = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
 
           // Log pushoo config being synced
-          console.log('[Loop Deploy] Pushoo config:', {
-            platform: freshPushoo.platform,
-            tokenLength: freshPushoo.token?.length || 0,
-            tokenPreview: freshPushoo.token ? freshPushoo.token.slice(0, 4) + '***' : '(none)',
-          });
+          console.log('[Loop Deploy] Pushoo channels:', freshPushoo.channels.length);
 
           const result = await LoopAgent.deploy({
             actionConfig: config,
@@ -2472,8 +2762,7 @@ const App = (() => {
               aiApiKey: apiKey,
               upstashUrl: getSessionSetting('upstashUrl') || undefined,
               upstashToken: getSessionSetting('upstashToken') || undefined,
-              pushooPlatform: freshPushoo.platform,
-              pushooToken: freshPushoo.token,
+              pushooChannels: freshPushoo.channels.length > 0 ? JSON.stringify(freshPushoo.channels) : undefined,
               encryptKey: encryptKey || undefined,
             },
             onProgress: (step, detail) => {
@@ -2517,7 +2806,7 @@ const App = (() => {
               <div style="font-size:13px;opacity:.8;margin-bottom:12px;">
                 <strong>How to interact:</strong><br>
                 • <code>/loop connect ${escapeHtml(loopKey)}</code> to chat with the agent directly from here<br>
-                • Send messages via ${escapeHtml(freshPushoo.platform)} — the agent will reply there<br>
+                • Send messages via ${hasWecom ? 'WeCom Bot' : PushooNotifier.getChannelSummary(freshPushoo)} — the agent will reply there<br>
                 • <code>/loop status</code> to check agent status
               </div>
 
@@ -2530,6 +2819,10 @@ const App = (() => {
           `;
 
           showToast(`Loop agent "${loopKey}" deployed and started!`, 'success');
+
+          // Show status panel automatically after deploy
+          showLoopStatusPanel();
+          setTimeout(() => refreshLoopStatusPanel(), 5000); // Delay for GHA to start
         } catch (err) {
           bubble.innerHTML = '';
           const statusCard = createStatusCard(bubble);
@@ -2766,6 +3059,22 @@ const App = (() => {
 
   let settingsTarget = null; // session ID being edited
 
+  // Helper: Update pushoo status badge when opening settings
+  function updatePushooStatusBadge() {
+    const badge = $('#pushoo-status-badge');
+    if (!badge || !settingsTarget) return;
+    const cfg = getSessionConfig(settingsTarget);
+    const pc = PushooNotifier.parseConfig(cfg.pushooConfig);
+    if (pc.channels.length > 0) {
+      const summary = PushooNotifier.getChannelSummary(pc);
+      badge.textContent = `✅ ${summary}`;
+      badge.style.color = '#22863a';
+    } else {
+      badge.textContent = tl('notConfigured');
+      badge.style.color = '#888';
+    }
+  }
+
   /**
    * Open settings panel for a session.
    * If no sessionId given, opens for the current session.
@@ -2821,8 +3130,6 @@ const App = (() => {
     $('#set-github-path').value = get('githubPath', 'sessions');
     $('#set-notion-storage-token').value = get('notionStorageToken', '');
     $('#set-notion-parent-page').value = get('notionParentPageId', '');
-    $('#set-resend-api-key').value = get('resendApiKey', '');
-    $('#set-notify-email').value = get('notifyEmail', '');
     
     // Set provider/model from saved config
     const modelValue = get('model', '');
@@ -2909,8 +3216,6 @@ const App = (() => {
       githubPath:         $('#set-github-path').value.trim() || 'sessions',
       notionStorageToken: $('#set-notion-storage-token').value.trim(),
       notionParentPageId: $('#set-notion-parent-page').value.trim(),
-      resendApiKey:       $('#set-resend-api-key').value.trim(),
-      notifyEmail:        $('#set-notify-email').value.trim(),
       pushooConfig:       getSessionConfig(sessionId)?.pushooConfig || '', // Preserve from previous dialog config
       upstashUrl:         $('#set-upstash-url').value.trim(),
       upstashToken:       $('#set-upstash-token').value.trim(),
@@ -3809,15 +4114,12 @@ const App = (() => {
 
           const settings = {
             geminiApiKey: getSessionSetting('apiKey'),
-            resendApiKey: getSessionSetting('resendApiKey'),
-            notifyEmail: getSessionSetting('notifyEmail'),
           };
 
-          // Add Pushoo configuration if enabled
+          // Add Pushoo multi-channel configuration
           const pc = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
-          if (pc.platform && pc.token) {
-            settings.PUSHOO_PLATFORM = pc.platform;
-            settings.PUSHOO_TOKEN = pc.token;
+          if (pc.channels.length > 0) {
+            settings.PUSHOO_CHANNELS = JSON.stringify(pc.channels);
           }
 
           const result = await GitHubActions.syncSecretsAndVars(config, settings);
@@ -4166,8 +4468,9 @@ const App = (() => {
     const useStorage = getSessionSetting('actionUseStorage', true);
     const actionOwner = useStorage ? getSessionSetting('githubOwner') : getSessionSetting('actionOwner');
     const actionRepo = useStorage ? getSessionSetting('githubRepo') : getSessionSetting('actionRepo');
-    const hasResendKey = !!getSessionSetting('resendApiKey');
-    const notifyEmail = getSessionSetting('notifyEmail');
+    const hasResendKey = false; // Resend removed — use pushoo channels
+    const pushooChannels = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
+    const channelSummary = PushooNotifier.getChannelSummary(pushooChannels);
 
     const lines = [
       '## 📋 Current Session Context',
@@ -4182,28 +4485,27 @@ const App = (() => {
     if (actionOwner) lines.push(`- **GitHub Owner**: \`${actionOwner}\``);
     if (actionRepo) lines.push(`- **GitHub Actions Repo**: \`${actionRepo}\``);
 
-    lines.push(`- **Resend API Key**: ${hasResendKey ? '✅ configured' : '❌ not set'}`);
-    lines.push(`- **Notification Email**: ${notifyEmail ? '\`' + notifyEmail + '\`' : '❌ not set'}`);
+    lines.push(`- **Notification Channels**: ${channelSummary || '❌ not configured'}`);
     lines.push('');
     lines.push('---');
     lines.push('');
     lines.push('## ⛔ MANDATORY RULES — YOU MUST FOLLOW THESE');
     lines.push('');
-    lines.push('### Rule 1: Never Generate Content Directly When Email Delivery Is Requested');
+    lines.push('### Rule 1: Never Generate Content Directly When Notification Delivery Is Requested');
     lines.push('');
-    lines.push('When the user asks you to do something AND send/email the result:');
-    lines.push('- ❌ WRONG: Generate the content in your chat response, then ask "should I send it to your email?"');
-    lines.push('- ❌ WRONG: Show the content in chat and say "I need your email"');
+    lines.push('When the user asks you to do something AND send/notify the result:');
+    lines.push('- ❌ WRONG: Generate the content in your chat response, then ask "should I send a notification?"');
+    lines.push('- ❌ WRONG: Show the content in chat and say "I need your notification config"');
     lines.push('- ❌ WRONG: Produce content as text and offer to "set up automation later"');
-    lines.push('- ✅ CORRECT: Generate a **Python script** that does the work AND sends the email. The user can then use ▶ Run to execute it or /schedule to make it recurring.');
+    lines.push('- ✅ CORRECT: Generate a **Python script** that does the work AND sends the notification. The user can then use ▶ Run to execute it or /schedule to make it recurring.');
     lines.push('');
     lines.push('The content must be generated BY THE SCRIPT AT RUNTIME on GitHub Actions — not by you in the chat.');
     lines.push('');
     lines.push('### Rule 2: Use the Session Values Above');
     lines.push('- Use the model name above in generated scripts (do not ask the user which model).');
     lines.push('- If a key is marked ✅, reference it as a GitHub Actions secret (e.g. `${{ secrets.GEMINI_API_KEY }}`) — do not ask the user to provide the value again.');
-    lines.push('- Secrets (GEMINI_API_KEY, RESEND_API_KEY) and variables (NOTIFY_EMAIL) are **automatically synced** to the GitHub repo when the user clicks Deploy. Do NOT tell the user to manually add secrets or variables.');
-    lines.push(`- If Notification Email is set above (${notifyEmail || 'not set'}), use it directly in the script.`);
+    lines.push('- Secrets (GEMINI_API_KEY, PUSHOO_CHANNELS) are **automatically synced** to the GitHub repo when the user clicks Deploy. Do NOT tell the user to manually add secrets or variables.');
+    lines.push('- If notification channels are configured above, use PUSHOO_CHANNELS secret in workflow scripts for multi-channel notification.');
     lines.push('- If a key is marked ❌, tell the user they need to configure it first in 🍤 小虾米 settings.');
     lines.push('');
     lines.push('### Rule 3: Scheduling Is Handled by the /schedule Command');
@@ -5055,6 +5357,10 @@ const App = (() => {
       }
     });
 
+    // Loop agent status panel buttons
+    $('#loop-panel-refresh')?.addEventListener('click', () => refreshLoopStatusPanel());
+    $('#loop-panel-close')?.addEventListener('click', () => hideLoopStatusPanel());
+
     $('#message-input')?.addEventListener('keydown', (e) => {
       const isComposing = e.isComposing || e.keyCode === 229;
 
@@ -5183,59 +5489,101 @@ const App = (() => {
 
     $('#set-soul-preset')?.addEventListener('change', toggleSoulUrlField);
 
-    // Pushoo configuration dialog — structured form
+    // Pushoo configuration dialog — multi-channel form
     const pushooDialog = $('#pushoo-config-dialog');
 
-    function updatePushooStatusBadge() {
-      const badge = $('#pushoo-status-badge');
-      if (!badge || !settingsTarget) return;
-      const cfg = getSessionConfig(settingsTarget);
-      const pc = PushooNotifier.parseConfig(cfg.pushooConfig);
-      if (pc.platform && pc.token) {
-        const pl = PushooNotifier.getSupportedPlatforms(currentLang).find(p => p.name === pc.platform);
-        badge.textContent = `✅ ${pl ? pl.label : pc.platform}`;
-        badge.style.color = '#22863a';
-      } else {
-        badge.textContent = tl('notConfigured');
-        badge.style.color = '#888';
-      }
+    // Multi-channel pushoo dialog logic
+    let _pushooEditChannels = []; // Temporary edit state for the dialog
+
+    function buildPlatformOptions(selectedPlatform) {
+      return PushooNotifier.getSupportedPlatforms(currentLang).map(
+        p => `<option value="${p.name}" ${p.name === selectedPlatform ? 'selected' : ''}>${escapeHtml(p.label)}</option>`
+      ).join('');
     }
 
-    function populatePushooForm() {
-      const select = $('#pushoo-platform');
-      if (!select) return;
-      select.innerHTML = PushooNotifier.getSupportedPlatforms(currentLang).map(
-        p => `<option value="${p.name}">${escapeHtml(p.label)}</option>`
-      ).join('');
+    function renderChannelRow(index, channel) {
+      const hint = PushooNotifier.getPlatformHint(channel.platform, currentLang);
+      return `
+        <div class="pushoo-channel-row" data-index="${index}" style="border:1px solid var(--border-color,#333);border-radius:8px;padding:12px;position:relative;">
+          <button type="button" class="pushoo-remove-channel" data-index="${index}" style="position:absolute;top:6px;right:8px;background:none;border:none;color:#888;cursor:pointer;font-size:16px;" title="${tl('removeChannel')}">&times;</button>
+          <div style="margin-bottom:8px;">
+            <label style="font-size:12px;color:#999;margin-bottom:4px;display:block;">${tl('platform')}</label>
+            <select class="pushoo-ch-platform schedule-input" data-index="${index}" style="width:100%;">
+              ${buildPlatformOptions(channel.platform)}
+            </select>
+          </div>
+          <div>
+            <label style="font-size:12px;color:#999;margin-bottom:4px;display:block;">${tl('tokenKey')}</label>
+            <div class="password-input-group">
+              <input type="password" class="pushoo-ch-token schedule-input" data-index="${index}" value="${escapeHtml(channel.token)}" placeholder="..." autocomplete="off" />
+              <button type="button" class="password-toggle pushoo-ch-toggle" data-index="${index}" title="Show/hide">👁</button>
+            </div>
+            <div class="hint pushoo-ch-hint" data-index="${index}" style="margin-top:4px;font-size:12px;">${escapeHtml(hint)}</div>
+          </div>
+        </div>
+      `;
+    }
 
-      select.addEventListener('change', () => {
-        $('#pushoo-token-hint').textContent = PushooNotifier.getPlatformHint(select.value, currentLang);
+    function renderChannelsList() {
+      const container = $('#pushoo-channels-list');
+      if (!container) return;
+      if (_pushooEditChannels.length === 0) {
+        container.innerHTML = `<div style="text-align:center;color:#888;padding:16px;font-size:13px;">${tl('noChannels')}</div>`;
+      } else {
+        container.innerHTML = _pushooEditChannels.map((ch, i) => renderChannelRow(i, ch)).join('');
+      }
+
+      // Bind events for newly rendered rows
+      container.querySelectorAll('.pushoo-remove-channel').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const idx = parseInt(btn.dataset.index);
+          _pushooEditChannels.splice(idx, 1);
+          renderChannelsList();
+        });
+      });
+      container.querySelectorAll('.pushoo-ch-platform').forEach(sel => {
+        sel.addEventListener('change', () => {
+          const idx = parseInt(sel.dataset.index);
+          _pushooEditChannels[idx].platform = sel.value;
+          const hintEl = container.querySelector(`.pushoo-ch-hint[data-index="${idx}"]`);
+          if (hintEl) hintEl.textContent = PushooNotifier.getPlatformHint(sel.value, currentLang);
+        });
+      });
+      container.querySelectorAll('.pushoo-ch-token').forEach(inp => {
+        inp.addEventListener('input', () => {
+          const idx = parseInt(inp.dataset.index);
+          _pushooEditChannels[idx].token = inp.value;
+        });
+      });
+      container.querySelectorAll('.pushoo-ch-toggle').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const idx = parseInt(btn.dataset.index);
+          const inp = container.querySelector(`.pushoo-ch-token[data-index="${idx}"]`);
+          if (inp) inp.type = inp.type === 'password' ? 'text' : 'password';
+        });
       });
     }
-    populatePushooForm();
 
     $('#pushoo-config-btn')?.addEventListener('click', () => {
       if (!settingsTarget) return;
       const cfg = getSessionConfig(settingsTarget);
       const pc = PushooNotifier.parseConfig(cfg.pushooConfig);
-
-      $('#pushoo-platform').value = pc.platform;
-      $('#pushoo-token').value = pc.token;
-      $('#pushoo-token-hint').textContent = PushooNotifier.getPlatformHint(pc.platform, currentLang);
-
+      _pushooEditChannels = pc.channels.map(ch => ({ ...ch }));
+      renderChannelsList();
       show(pushooDialog);
+    });
+
+    $('#pushoo-add-channel')?.addEventListener('click', () => {
+      const defaultPlatform = PushooNotifier.getSupportedPlatforms(currentLang)[0]?.name || 'telegram';
+      _pushooEditChannels.push({ platform: defaultPlatform, token: '' });
+      renderChannelsList();
     });
 
     $('#pushoo-config-save')?.addEventListener('click', () => {
       if (!settingsTarget) return;
-      const platform = $('#pushoo-platform').value?.trim();
-      const token = $('#pushoo-token').value?.trim();
-      
-      const pc = {
-        enabled: !!(platform && token),
-        platform: platform,
-        token: token,
-      };
+      // Filter out channels with empty tokens
+      const validChannels = _pushooEditChannels.filter(ch => ch.platform && ch.token?.trim());
+      const pc = { channels: validChannels.map(ch => ({ platform: ch.platform, token: ch.token.trim() })) };
       const cfg = getSessionConfig(settingsTarget);
       cfg.pushooConfig = PushooNotifier.serializeConfig(pc);
       saveSessionConfig(settingsTarget, cfg);

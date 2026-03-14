@@ -4,47 +4,43 @@
  * Pushoo API is extremely simple:
  *   pushoo(platform, { token, title, content })
  *
- * Config stored per-session: { enabled, platform, token }
+ * Config stored per-session as JSON:
+ *   { channels: [{ platform, token }, ...] }
+ *
+ * Special platforms (use native SDK in runner.js, not pushoo):
+ *   - telegram: token format "botToken#chatId"
+ *   - wecombot: token format "botId#secret"
  */
 
 import { t } from './i18n.js';
 
 const PushooNotifier = (() => {
+  // Curated list of well-supported platforms
   const PLATFORM_NAMES = [
-    'serverchan', 'pushplus', 'pushplushxtrip', 'dingtalk', 'wecom', 'wecombot',
-    'bark', 'telegram', 'feishu', 'discord', 'webhook', 'qmsg', 'gocqhttp',
-    'atri', 'pushdeer', 'igot', 'ifttt', 'wxpusher', 'join',
+    'telegram', 'wecombot', 'discord', 'dingtalk', 'feishu',
+    'serverchan', 'pushplus', 'wecom', 'bark', 'webhook',
   ];
 
-  function getPlatforms(lang = 'en') {
-    const platformMap = {
-      serverchan: { name: 'serverchan', labelKey: 'platServerchan', hintKey: 'platServerchanHint' },
-      pushplus: { name: 'pushplus', labelKey: 'platPushplus', hintKey: 'platPushplusHint' },
-      pushplushxtrip: { name: 'pushplushxtrip', labelKey: 'platPushplus', hintKey: 'platPushplusHint' },
-      dingtalk: { name: 'dingtalk', labelKey: 'platDingtalk', hintKey: 'platDingtalkHint' },
-      wecom: { name: 'wecom', labelKey: 'platWecom', hintKey: 'platWecomHint' },
-      wecombot: { name: 'wecombot', labelKey: 'platWecom', hintKey: 'platWecomHint' },
-      bark: { name: 'bark', labelKey: 'platBark', hintKey: 'platBarkHint' },
-      telegram: { name: 'telegram', labelKey: 'platTelegram', hintKey: 'platTelegramHint' },
-      feishu: { name: 'feishu', labelKey: 'platFeishu', hintKey: 'platFeishuHint' },
-      discord: { name: 'discord', labelKey: 'platDiscord', hintKey: 'platDiscordHint' },
-      webhook: { name: 'webhook', labelKey: 'platWebhook', hintKey: 'platWebhookHint' },
-      qmsg: { name: 'qmsg', labelKey: 'platQmsg', hintKey: 'platQmsgHint' },
-      gocqhttp: { name: 'gocqhttp', labelKey: 'platGocqhttp', hintKey: 'platQmsgHint' },
-      atri: { name: 'atri', labelKey: 'platAtri', hintKey: 'platQmsgHint' },
-      pushdeer: { name: 'pushdeer', labelKey: 'msgNotSet', hintKey: 'msgNotSet' },
-      igot: { name: 'igot', labelKey: 'msgNotSet', hintKey: 'msgNotSet' },
-      ifttt: { name: 'ifttt', labelKey: 'msgNotSet', hintKey: 'msgNotSet' },
-      wxpusher: { name: 'wxpusher', labelKey: 'msgNotSet', hintKey: 'msgNotSet' },
-      join: { name: 'join', labelKey: 'msgNotSet', hintKey: 'msgNotSet' },
-    };
+  const PLATFORM_MAP = {
+    telegram:   { labelKey: 'platTelegram',   hintKey: 'platTelegramHint' },
+    wecombot:   { labelKey: 'platWecomBot',   hintKey: 'platWecomBotHint' },
+    discord:    { labelKey: 'platDiscord',    hintKey: 'platDiscordHint' },
+    dingtalk:   { labelKey: 'platDingtalk',   hintKey: 'platDingtalkHint' },
+    feishu:     { labelKey: 'platFeishu',     hintKey: 'platFeishuHint' },
+    serverchan: { labelKey: 'platServerchan', hintKey: 'platServerchanHint' },
+    pushplus:   { labelKey: 'platPushplus',   hintKey: 'platPushplusHint' },
+    wecom:      { labelKey: 'platWecom',      hintKey: 'platWecomHint' },
+    bark:       { labelKey: 'platBark',       hintKey: 'platBarkHint' },
+    webhook:    { labelKey: 'platWebhook',    hintKey: 'platWebhookHint' },
+  };
 
+  function getPlatforms(lang = 'en') {
     return PLATFORM_NAMES.map(name => {
-      const config = platformMap[name];
+      const cfg = PLATFORM_MAP[name];
       return {
-        name: config.name,
-        label: t(lang, config.labelKey),
-        hint: t(lang, config.hintKey),
+        name,
+        label: t(lang, cfg.labelKey),
+        hint: t(lang, cfg.hintKey),
       };
     });
   }
@@ -54,42 +50,65 @@ const PushooNotifier = (() => {
   }
 
   function getPlatformHint(platformName, lang = 'en') {
-    const platforms = getPlatforms(lang);
-    const p = platforms.find(pl => pl.name === platformName);
-    return p ? p.hint : t(lang, 'msgNotSet');
+    const cfg = PLATFORM_MAP[platformName];
+    return cfg ? t(lang, cfg.hintKey) : '';
   }
 
-  function validateConfig(config) {
-    if (!config) return false;
-    if (!config.platform || typeof config.platform !== 'string') return false;
-    if (!config.token || typeof config.token !== 'string') return false;
-    return true;
-  }
-
+  /**
+   * Parse stored config JSON into { channels: [{ platform, token }] }.
+   * Handles both new multi-channel format and legacy single-channel format.
+   */
   function parseConfig(raw) {
-    if (!raw) return { enabled: false, platform: 'serverchan', token: '' };
+    if (!raw) return { channels: [] };
     try {
       const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      return {
-        enabled: !!obj.enabled,
-        platform: obj.platform || 'serverchan',
-        token: obj.token || '',
-      };
+      // New multi-channel format
+      if (Array.isArray(obj.channels)) {
+        return { channels: obj.channels.filter(ch => ch.platform && ch.token) };
+      }
+      // Legacy single-channel format: { enabled, platform, token }
+      if (obj.platform && obj.token) {
+        return { channels: [{ platform: obj.platform, token: obj.token }] };
+      }
+      return { channels: [] };
     } catch {
-      return { enabled: false, platform: 'serverchan', token: '' };
+      return { channels: [] };
     }
   }
 
   function serializeConfig(cfg) {
-    return JSON.stringify({ enabled: !!cfg.enabled, platform: cfg.platform || '', token: cfg.token || '' });
+    const channels = (cfg.channels || []).filter(ch => ch.platform && ch.token);
+    return JSON.stringify({ channels });
+  }
+
+  /**
+   * Check if at least one valid channel is configured.
+   */
+  function hasChannels(cfg) {
+    const parsed = typeof cfg === 'string' ? parseConfig(cfg) : cfg;
+    return parsed.channels.length > 0;
+  }
+
+  /**
+   * Get summary text for configured channels (for badge display).
+   */
+  function getChannelSummary(cfg, lang = 'en') {
+    const parsed = typeof cfg === 'string' ? parseConfig(cfg) : cfg;
+    if (parsed.channels.length === 0) return '';
+    const platforms = getPlatforms(lang);
+    return parsed.channels.map(ch => {
+      const p = platforms.find(pl => pl.name === ch.platform);
+      return p ? p.label : ch.platform;
+    }).join(', ');
   }
 
   return {
     getSupportedPlatforms,
     getPlatformHint,
-    validateConfig,
     parseConfig,
     serializeConfig,
+    hasChannels,
+    getChannelSummary,
   };
 })();
 
