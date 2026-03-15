@@ -2737,8 +2737,12 @@ const App = (() => {
         const encryptKey = bubble.querySelector('#loop-encrypt-key').value.trim() || '';
 
         try {
-          // Load runner script
-          const runnerScript = await LoopAgent.getRunnerScript();
+          // Load runner script and sub-agent script
+          const [runnerScript, subAgentScript, browserAgentScript] = await Promise.all([
+            LoopAgent.getRunnerScript(),
+            LoopAgent.getSubAgentScript(),
+            LoopAgent.getBrowserAgentScript(),
+          ]);
 
           // Re-read pushoo config fresh (user may have configured it after wizard appeared)
           const freshPushoo = PushooNotifier.parseConfig(getSessionSetting('pushooConfig'));
@@ -2749,6 +2753,8 @@ const App = (() => {
           const result = await LoopAgent.deploy({
             actionConfig: config,
             runnerScript,
+            subAgentScript,
+            browserAgentScript,
             loopKey,
             agentOpts: {
               provider,

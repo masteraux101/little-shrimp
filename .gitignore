@@ -7,3 +7,4 @@ playground/
 .env
 loop_agent_guide.md
 instructions.md
+.explorer-tmp/

@@ -14,10 +14,12 @@ const LoopAgent = (() => {
   /* eslint-disable -- keeping original structure */
 
   /**
-   * The runner.js content is loaded from the public/ directory.
+   * The runner.js and sub-agent.js content is loaded from the public/ directory.
    * Public files are not processed by Vite, avoiding dynamic import issues.
    */
   let _runnerScriptCache = null;
+  let _subAgentScriptCache = null;
+  let _browserAgentScriptCache = null;
 
   async function getRunnerScript() {
     if (_runnerScriptCache) return _runnerScriptCache;
@@ -26,6 +28,22 @@ const LoopAgent = (() => {
     if (!resp.ok) throw new Error(`Failed to load loop-agent runner: ${resp.status}`);
     _runnerScriptCache = await resp.text();
     return _runnerScriptCache;
+  }
+
+  async function getSubAgentScript() {
+    if (_subAgentScriptCache) return _subAgentScriptCache;
+    const resp = await fetch('/shrimp/loop-agent/sub-agent.js');
+    if (!resp.ok) throw new Error(`Failed to load loop-agent sub-agent: ${resp.status}`);
+    _subAgentScriptCache = await resp.text();
+    return _subAgentScriptCache;
+  }
+
+  async function getBrowserAgentScript() {
+    if (_browserAgentScriptCache) return _browserAgentScriptCache;
+    const resp = await fetch('/shrimp/loop-agent/browser-agent.js');
+    if (!resp.ok) throw new Error(`Failed to load loop-agent browser-agent: ${resp.status}`);
+    _browserAgentScriptCache = await resp.text();
+    return _browserAgentScriptCache;
   }
 
   /**
@@ -103,6 +121,8 @@ const LoopAgent = (() => {
    * @param {Object} opts
    * @param {Object} opts.actionConfig - { token, owner, repo, branch }
    * @param {string} opts.runnerScript - The runner.js content
+   * @param {string} opts.subAgentScript - The sub-agent.js content
+   * @param {string} opts.browserAgentScript - The browser-agent.js content
    * @param {string} opts.loopKey - Unique loop key
    * @param {Object} opts.agentOpts - { provider, model, pollInterval, maxRuntime, systemPrompt }
    * @param {Object} opts.secrets - { aiApiKey, pushooChannels }
@@ -113,6 +133,8 @@ const LoopAgent = (() => {
     const {
       actionConfig,
       runnerScript,
+      subAgentScript,
+      browserAgentScript,
       loopKey,
       agentOpts = {},
       secrets = {},
@@ -145,6 +167,8 @@ const LoopAgent = (() => {
     progress('push', t(lang, 'loopStepPush'));
     const files = [
       { path: 'loop-agent/runner.js', content: runnerScript },
+      { path: 'loop-agent/sub-agent.js', content: subAgentScript },
+      { path: 'loop-agent/browser-agent.js', content: browserAgentScript },
       { path: workflowPath, content: workflowYaml },
     ];
     await GitHubActions.pushFiles(actionConfig, files, `[loop-agent] Deploy ${loopKey}`);
@@ -480,6 +504,8 @@ const LoopAgent = (() => {
 
   return {
     getRunnerScript,
+    getSubAgentScript,
+    getBrowserAgentScript,
     generateLoopKey,
     generateWorkflowYaml,
     deploy,

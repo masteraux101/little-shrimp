@@ -492,7 +492,7 @@ async function selfRestart() {
 
 // ─── Built-in Tools ─────────────────────────────────────────────────
 
-function createBuiltinTools(repoStore) {
+function createBuiltinTools(repoStore, llm, notifyFn) {
   const { tool } = require('@langchain/core/tools');
   const { z } = require('zod');
 
@@ -579,13 +579,24 @@ function createBuiltinTools(repoStore) {
 
   // 3. Run JavaScript — execute a JS snippet in a sandboxed VM
   tools.push(tool(async ({ code }) => {
+    // Guard: detect Playwright test-style code that expects a browser context.
+    // The run_js VM sandbox has NO Playwright, no "page", no "browser", no require().
+    if (/\(\s*\{\s*page\s*\}\s*\)\s*=>|\brequire\s*\(\s*['"]playwright/.test(code)) {
+      return 'Error: run_js is a bare sandboxed VM with no Playwright/browser access. Use the explore_task tool for browser automation, or screenshot_page for taking screenshots.';
+    }
     try {
       const vm = require('vm');
       const sandbox = { console: { log: (...args) => { output.push(args.map(String).join(' ')); } }, result: undefined };
       const output = [];
       const script = new vm.Script(code);
       const context = vm.createContext(sandbox);
-      script.runInContext(context, { timeout: 10000 });
+      const returnValue = script.runInContext(context, { timeout: 10000 });
+      // If the script returns a Promise (e.g. async IIFE), await it to catch
+      // async errors like destructuring failures that would otherwise become
+      // unhandled rejections and crash the process.
+      if (returnValue && typeof returnValue.then === 'function') {
+        await returnValue.catch(e => { output.push(`Async error: ${e.message}`); });
+      }
       const logs = output.join('\n');
       const result = sandbox.result !== undefined ? String(sandbox.result) : '';
       return [logs, result ? `Result: ${result}` : ''].filter(Boolean).join('\n') || '(no output)';
@@ -945,8 +956,18 @@ function createBuiltinTools(repoStore) {
       browser = await chromium.launch({ headless: true });
       console.log(`[Screenshot] Browser launched in ${Date.now() - launchStart}ms`);
 
+      // Use saved browser state (cookies/localStorage) if available from sub-agent.
+      // This ensures screenshots reflect the actual authenticated state.
+      const browserStatePath = '/tmp/loop-agent-browser-state/storage-state.json';
+      const contextOpts = { viewport: { width: 1280, height: 720 } };
+      if (fs.existsSync(browserStatePath)) {
+        contextOpts.storageState = browserStatePath;
+        console.log(`[Screenshot] Loaded saved browser state for auth context`);
+      }
+      const browserContext = await browser.newContext(contextOpts);
+
       console.log(`[Screenshot] Creating page (viewport: 1280x720)...`);
-      const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+      const page = await browserContext.newPage();
 
       console.log(`[Screenshot] Navigating to ${url}...`);
       const navStart = Date.now();
@@ -1620,6 +1641,26 @@ CROP_REGION: {"x": <left>, "y": <top>, "width": <width>, "height": <height>}`;
     schema: z.object({}),
   }));
 
+  // ── Browser Agent tool (ReAct browser automation) ──
+  if (llm) {
+    try {
+      const { createBrowserTool } = require('./browser-agent');
+      tools.push(createBrowserTool(llm, notifyFn, sendTelegramPhoto));
+    } catch (e) {
+      console.warn(`[Tools] browser-agent not available: ${e.message}`);
+    }
+  }
+
+  // ── Explorer Sub-Agent tool (code generation & execution) ──
+  if (llm) {
+    try {
+      const { createExplorerTool } = require('./sub-agent');
+      tools.push(createExplorerTool(llm, repoStore, notifyFn, sendTelegramPhoto));
+    } catch (e) {
+      console.warn(`[Tools] sub-agent not available: ${e.message}`);
+    }
+  }
+
   return tools;
 }
 
@@ -1895,6 +1936,7 @@ Available tools:
 - screenshot_page: Take a full-page screenshot of a URL, automatically send it to the user via Telegram, and return a brief AI-generated summary.
 - analyze_page_visual: Send a screenshot to the AI vision model for detailed layout analysis. Returns crop coordinates for important regions.
 - crop_image: Crop a region from an image and send it to the user via Telegram.
+- explore_task: Launch the Explorer sub-agent for complex tasks. For browser tasks it uses a ReAct loop (Observe → Think → Act → Verify) with atomic actions, avoiding full script generation. For non-browser tasks it generates and executes custom code. Use when no existing tool fits, a tool failed, or the task requires multi-step browser automation.
 
 PAGE SCREENSHOT (when user asks to screenshot or view a URL):
 1. screenshot_page — captures the full page, sends image to user via Telegram, returns a brief summary
@@ -1926,6 +1968,7 @@ CRITICAL RULES:
 7. After successfully completing an API task, ALWAYS use save_memory to store the API endpoint, auth method, and required parameters so you can reuse them later.
 8. BEFORE starting any task, use read_memory to check if you have previously saved relevant API details or patterns. If memory has the info, USE IT — do not search the web or guess.
 9. Do NOT hallucinate API endpoints or parameters. If you don't know the correct API, fetch the documentation URL first.
+10. When a task is too complex for existing tools (multi-step web automation, dynamic scraping of SPAs, cross-page logic), or when a tool fails with errors like SelectorNotFoundError/TimeoutError, use explore_task. For browser tasks it drives a real browser step-by-step with atomic actions (click, type, scroll); for non-browser tasks it generates and executes custom code.
 
 User commands (slash commands):
 - /memory clear — Clear the persistent memory file
@@ -2065,6 +2108,7 @@ Available tools (these are REAL tools you can call in the execution phase):
 - search_skills: Unified search across built-in skills and ClawHub community registry
 - load_skill: Load a skill by URL, built-in name, or ClawHub slug
 - clawhub_skill_detail: Get full details for a ClawHub skill by slug
+- explore_task: Explorer sub-agent for complex tasks — uses a ReAct browser loop for web automation or code generation for non-browser tasks
 
 Classify the request:
 1. "direct" — Can be handled with the available tools above. This includes:
@@ -3756,7 +3800,20 @@ async function main() {
   let graphState;
   try {
     const llm = createLLM(AI_PROVIDER, AI_MODEL, AI_API_KEY);
-    const tools = createBuiltinTools(repoStore);
+    // Create a notification callback for the Explorer sub-agent to send
+    // intermediate progress updates so users don't experience long silences.
+    const explorerNotifyFn = async (msg) => {
+      try {
+        if (_runtime.listener && _runtime.listener.sendMsg) {
+          await _runtime.listener.sendMsg(msg);
+        } else {
+          await sendNotifications(PUSHOO_CHANNELS, '[Explorer Progress]', msg);
+        }
+      } catch (e) {
+        console.error(`[Explorer Notify] Failed: ${e.message}`);
+      }
+    };
+    const tools = createBuiltinTools(repoStore, llm, explorerNotifyFn);
     console.log(`[Tools] Registered ${tools.length} tools: ${tools.map(t => t.name).join(', ')}`);
 
     const checkpointer = new Checkpointer(repoStore, LOOP_HISTORY_PATH);
@@ -3851,6 +3908,13 @@ async function main() {
   // Block forever — event loop is kept alive by Telegraf/WeCom/setTimeout
   await new Promise(() => {});
 }
+
+// Safety net: prevent unhandled promise rejections (e.g. from VM-executed async
+// code) from crashing the process. Log the error and continue running.
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(`[SAFETY] Unhandled promise rejection: ${reason}`);
+  if (reason && reason.stack) console.error(`[SAFETY] Stack: ${reason.stack}`);
+});
 
 main().catch(err => {
   console.error(`[FATAL] Unhandled error: ${err.message}`);
