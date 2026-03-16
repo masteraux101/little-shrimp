@@ -2,13 +2,32 @@
 
 语言版本：[English](README.md) | [简体中文](README.zh-CN.md)
 
-🍤 小虾米是一个完全在浏览器中运行的多模型 AI 工作台，支持会话级隔离配置、SOUL 人格定制、Skill 技能扩展、端到端加密存储以及 GitHub Actions 集成。
+🍤 小虾米是一个完全在浏览器中运行的多模型 AI 工作台，核心功能是 **Loop Agent**（在 GitHub Actions 上运行的持久化 AI 代理），同时支持会话级隔离配置、SOUL 人格定制、Skill 技能扩展、端到端加密存储以及 GitHub Actions 集成。
 
 项目采用 Vite 构建，核心流程在浏览器中完成，不依赖必须的后端服务。
 
 ## 在线体验
 
 - GitHub Pages：`https://masteraux101.github.io/shrimp/`
+
+## 核心亮点：Loop Agent
+
+Loop Agent 是小虾米的核心功能 —— 在 GitHub Actions 上部署持久化 AI 代理，通过 Telegram、企业微信机器人或浏览器对话与你交互。
+
+**主要能力：**
+
+- 🔄 **持久化执行** — 运行在 GitHub Actions 上，支持自愈（workflow 超时后自动接续）
+- 🤖 **任意 OpenAI 兼容模型** — 支持 GPT、DeepSeek、Claude、Qwen 或任何提供 OpenAI 兼容 API 的服务
+- 💬 **双向消息** — 通过 Telegram 机器人、企业微信 Webhook 或浏览器 UI 交互
+- 🔐 **加密通信** — 浏览器与代理之间的消息使用你的密码进行加密
+- 🛠️ **35+ 内置工具** — 网页浏览、文件操作、代码执行、GitHub API 等
+
+**快速上手 Loop Agent：**
+
+1. 在设置中配置模型提供商、模型名和 API Key
+2. 设置 GitHub Token 和仓库
+3. 运行 `/loop` — 交互式引导将带你完成部署
+4. 使用 `/loop connect <key>` 建立通信连接
 
 ## 快速开始
 
@@ -46,7 +65,7 @@ npm run preview
 
 ### 多模型对话
 
-- 支持 Gemini、Qwen（DashScope 兼容）、Kimi（Moonshot 兼容）
+- 支持 Gemini、Qwen（DashScope 兼容）、Kimi（Moonshot 兼容）、**OpenAI 兼容**（任意 BaseURL + API Key）
 - provider/model/key 支持会话级隔离，必要时可回落到全局模板
 - 支持流式输出与会话级 token 统计
 
@@ -88,6 +107,7 @@ npm run preview
 - 配置未完成时显示 `完善配置中`
 - 配置完成但尚未与模型交互时显示 `默认会话`
 - 输入框上方快捷按钮：
+- Loop -> `/loop` — 部署和管理 Loop Agent
 - Skills -> `/skills`
 - Souls -> `/soul list`
 - Schedule -> `/schedule`
@@ -97,6 +117,16 @@ npm run preview
 
 ## 内置 Slash 命令
 
+### Loop Agent
+
+- `/loop` 部署 Loop Agent（交互式向导）
+- `/loop connect <key>` 连接到运行中的 Loop Agent
+- `/loop status` 检查 Loop Agent workflow 状态
+- `/loop dashboard` 打开 Loop Agent 仪表盘
+- `/loop stop` 停止 Loop Agent
+
+### 对话与会话
+
 - `/skills` 管理技能
 - `/skill <name-or-url>` 加载技能
 - `/soul` 查看当前 SOUL
@@ -104,6 +134,9 @@ npm run preview
 - `/soul <name-or-url>` 切换 SOUL
 - `/compact` 压缩上下文
 - `/clear` 清空当前会话
+
+### GitHub Actions
+
 - `/schedule` 从最近代码生成并部署 cron workflow
 - `/github status` 查看 workflows 与运行状态
 - `/github run [workflow]` 手动触发 workflow
@@ -115,12 +148,22 @@ npm run preview
 - `style.css` 全局样式
 - `src/app.js` 主协调器（UI、会话生命周期、引导、命令）
 - `src/chat.js` 对话状态与流式生命周期
-- `src/provider-api.js` 模型 provider 适配层
+- `src/provider-api.js` 模型 provider 适配层（Gemini / Qwen / Kimi / OpenAI 兼容）
 - `src/storage.js` 加密持久化（Local/GitHub/Notion）
 - `src/crypto.js` Web Crypto 加解密
 - `src/soul-loader.js` SOUL/Skill 加载解析
 - `src/github-actions.js` 工件推送、workflow 管理、运行轮询
+- `src/loop-agent.js` Loop Agent 部署（YAML 生成、密钥同步）
 - `src/pushoo.js` Pushoo 配置与平台信息
+
+Loop Agent 运行时（GitHub Actions）：
+
+- `public/loop-agent/runner.js` 主 Agent 入口（LangGraph + 35 工具）
+- `public/loop-agent/browser-agent.js` 浏览器通信代理
+- `public/loop-agent/sub-agent.js` 子代理执行模块
+
+内置目录：
+
 - `examples/souls/` 内置 SOUL 与索引
 - `examples/skills/` 内置 Skill 与索引
 

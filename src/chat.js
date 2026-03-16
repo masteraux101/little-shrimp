@@ -132,6 +132,7 @@ const Chat = (() => {
   async function send({
     apiKey,
     qwenApiKey,
+    openaiBaseUrl,
     provider,
     model,
     message,
@@ -208,6 +209,29 @@ const Chat = (() => {
 
         result = await ProviderAPI.Kimi.generateContent({
           apiKey: providerApiKey,
+          model,
+          systemInstruction: effectiveSystemInstruction,
+          messages,
+          enableSearch,
+          thinkingConfig,
+          onChunk: (chunk) => {
+            if (chunk.type === 'text') {
+              fullText += chunk.text;
+              if (onChunk) onChunk(chunk.text, fullText);
+            }
+          },
+        });
+
+        metadata.usage = result.usageInfo;
+      } else if (resolvedProvider === 'openai') {
+        const messages = history.map(msg => ({
+          role: msg.role === 'model' ? 'assistant' : 'user',
+          content: msg.parts?.map(p => p.text).join('') || msg.content || '',
+        }));
+
+        result = await ProviderAPI.OpenAICompat.generateContent({
+          apiKey: providerApiKey,
+          baseUrl: openaiBaseUrl,
           model,
           systemInstruction: effectiveSystemInstruction,
           messages,

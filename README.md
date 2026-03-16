@@ -2,7 +2,7 @@
 
 Languages: [English](README.md) | [简体中文](README.zh-CN.md)
 
-A fully browser-based multi-provider AI workspace with per-session SOUL/Skill customization, encrypted storage, and GitHub Actions integration.
+A fully browser-based multi-provider AI workspace with **Loop Agent** (persistent AI agent on GitHub Actions), per-session SOUL/Skill customization, encrypted storage, and GitHub Actions integration.
 
 This project runs in the browser (built with Vite). There is no required backend service for core chat/storage flows.
 
@@ -10,10 +10,29 @@ This project runs in the browser (built with Vite). There is no required backend
 
 Actively evolving. Features and UX are being iterated frequently.
 
+## Highlight: Loop Agent
+
+Loop Agent is the core feature of LittleShrimp — deploy a persistent AI agent that runs on GitHub Actions and communicates with you via Telegram, WeCom Bot, or browser chat.
+
+**Key capabilities:**
+
+- 🔄 **Persistent execution** — runs in GitHub Actions with self-healing (auto-continues if a workflow times out)
+- 🤖 **Any OpenAI-compatible model** — works with GPT, DeepSeek, Claude, Qwen, or any provider with an OpenAI-compatible API
+- 💬 **Bidirectional messaging** — interact via Telegram bot, WeCom webhook, or the browser UI
+- 🔐 **Encrypted communication** — messages between browser and agent are encrypted with your passphrase
+- 🛠️ **35+ built-in tools** — web browsing, file operations, code execution, GitHub API, and more
+
+**Quick start with Loop Agent:**
+
+1. Configure provider, model, and API key in Settings
+2. Set up GitHub token and repository
+3. Run `/loop` — the interactive guide will walk you through deployment
+4. Use `/loop connect <key>` to establish communication
+
 ## What It Does
 
 - Multi-provider chat
-- Supported providers: Gemini, Qwen (DashScope compatible), Kimi (Moonshot compatible)
+- Supported providers: Gemini, Qwen (DashScope compatible), Kimi (Moonshot compatible), **OpenAI Compatible** (any BaseURL + API Key)
 - Session-isolated configuration
 - Provider/model/API keys are stored per session (with global fallback templates)
 - Guided first-run setup (chat-style)
@@ -44,6 +63,7 @@ Actively evolving. Features and UX are being iterated frequently.
 - During setup, session title shows `Configuring...`
 - After setup and before first model interaction, title is `Default Session`
 - Quick action buttons above input:
+- `Loop` (`/loop`) — Deploy & manage Loop Agent
 - `Skills` (`/skills`)
 - `Souls` (`/soul list`)
 - `Schedule` (`/schedule`)
@@ -53,6 +73,16 @@ Actively evolving. Features and UX are being iterated frequently.
 
 ## Built-in Slash Commands
 
+### Loop Agent
+
+- `/loop` Deploy Loop Agent (interactive wizard)
+- `/loop connect <key>` Connect to a running Loop Agent
+- `/loop status` Check Loop Agent workflow status
+- `/loop dashboard` Open Loop Agent dashboard
+- `/loop stop` Stop Loop Agent
+
+### Chat & Session
+
 - `/skills` Manage skills
 - `/skill <name-or-url>` Load one skill
 - `/soul` Show current soul
@@ -60,6 +90,9 @@ Actively evolving. Features and UX are being iterated frequently.
 - `/soul <name-or-url>` Switch soul
 - `/compact` Compact conversation context
 - `/clear` Clear current session
+
+### GitHub Actions
+
 - `/schedule` Create cron workflow from generated code
 - `/github status` Show workflow/run status
 - `/github run [workflow]` Dispatch workflow
@@ -100,12 +133,19 @@ Core files:
 
 - `src/app.js`: Main coordinator (UI, session lifecycle, setup wizard, commands)
 - `src/chat.js`: Chat history + streaming + token accounting
-- `src/provider-api.js`: Provider adapters (Gemini / Qwen / Kimi)
+- `src/provider-api.js`: Provider adapters (Gemini / Qwen / Kimi / OpenAI Compatible)
 - `src/storage.js`: Local/GitHub/Notion encrypted persistence
 - `src/crypto.js`: Encryption/decryption utilities (Web Crypto)
 - `src/soul-loader.js`: SOUL/Skill loading and parsing
 - `src/github-actions.js`: Artifact push, workflow management, run polling
+- `src/loop-agent.js`: Loop Agent deployment (YAML generation, secret sync)
 - `src/pushoo.js`: Pushoo config and platform metadata
+
+Loop Agent runtime (GitHub Actions):
+
+- `public/loop-agent/runner.js`: Main agent entry point (LangGraph + 35 tools)
+- `public/loop-agent/browser-agent.js`: Browser communication agent
+- `public/loop-agent/sub-agent.js`: Sub-agent execution module
 
 Static and catalogs:
 

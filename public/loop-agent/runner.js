@@ -19,9 +19,10 @@
  *   UPSTASH_URL       — Upstash Redis REST URL (required in Upstash mode)
  *   UPSTASH_TOKEN     — Upstash Redis REST token (required in Upstash mode)
  *   LOOP_KEY          — Unique conversation key
- *   AI_PROVIDER       — gemini | qwen | kimi
+ *   AI_PROVIDER       — gemini | qwen | kimi | openai
  *   AI_MODEL          — Model ID
  *   AI_API_KEY        — Provider API key
+ *   AI_BASE_URL       — OpenAI-compatible base URL (used when provider=openai or as override)
  *   PUSHOO_CHANNELS   — JSON array of {platform, token} for multi-channel notifications
  *                        (legacy: PUSHOO_PLATFORM + PUSHOO_TOKEN still supported as fallback)
  *   GITHUB_TOKEN      — GitHub PAT for repo operations
@@ -207,6 +208,27 @@ class RepoStore {
       throw new Error(`GitHub write error: ${resp.status} ${err.message || ''}`);
     }
     return resp.json();
+  }
+
+  async deleteFile(path, message, branch = 'main') {
+    const existing = await this.readFile(path, branch);
+    if (!existing) return { deleted: false, reason: 'not_found' };
+
+    const body = {
+      message,
+      sha: existing.sha,
+      branch,
+    };
+
+    const resp = await fetch(
+      `${this.api}/repos/${this.owner}/${this.repo}/contents/${path}`,
+      { method: 'DELETE', headers: this._headers(), body: JSON.stringify(body) }
+    );
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(`GitHub delete error: ${resp.status} ${err.message || ''}`);
+    }
+    return { deleted: true };
   }
 }
 
@@ -449,6 +471,88 @@ async function sendTelegramPhoto(imagePath, caption) {
   }
 }
 
+/**
+ * Send an image to WeCom using replyStream + msg_item(image).
+ * Requires an active incoming frame context from the current conversation.
+ */
+async function sendWecomPhoto(wsClient, frame, imagePath, caption, generateReqIdFn) {
+  if (!wsClient || !frame) {
+    console.warn('[WeCom] Cannot send image: missing wsClient or active frame context');
+    return null;
+  }
+
+  const fs = require('fs');
+  const sharp = require('sharp');
+
+  try {
+    if (!fs.existsSync(imagePath)) {
+      console.error(`[WeCom] Image file not found: ${imagePath}`);
+      return null;
+    }
+
+    let imageBuffer = fs.readFileSync(imagePath);
+    const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // WeCom docs: raw image max 10MB before base64
+
+    // Try to normalize oversized images to stay within WeCom limits.
+    if (imageBuffer.length > MAX_IMAGE_BYTES) {
+      const metadata = await sharp(imageBuffer).metadata();
+      const maxDim = 2048;
+      imageBuffer = await sharp(imageBuffer)
+        .resize(maxDim, maxDim, { fit: 'inside', withoutEnlargement: true })
+        .png({ compressionLevel: 9 })
+        .toBuffer();
+      console.log(`[WeCom] Image resized ${metadata.width}x${metadata.height} -> <=${maxDim}px (${Math.round(imageBuffer.length / 1024)}KB)`);
+    }
+
+    if (imageBuffer.length > MAX_IMAGE_BYTES) {
+      console.error(`[WeCom] Image still too large after resize: ${Math.round(imageBuffer.length / 1024)}KB`);
+      return null;
+    }
+
+    const md5 = nodeCrypto.createHash('md5').update(imageBuffer).digest('hex');
+    const base64 = imageBuffer.toString('base64');
+    const streamId = generateReqIdFn ? generateReqIdFn('stream') : `stream-${Date.now()}`;
+    const text = caption || '🖼 Image';
+
+    await wsClient.replyStream(
+      frame,
+      streamId,
+      text,
+      true,
+      [{ msgtype: 'image', image: { base64, md5 } }]
+    );
+
+    console.log(`[WeCom] ✓ Image sent (${Math.round(imageBuffer.length / 1024)}KB)`);
+    return { ok: true, size: imageBuffer.length };
+  } catch (e) {
+    console.error(`[WeCom] Failed to send image: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Route image delivery to the currently active bidirectional channel.
+ * When WeCom is active, NEVER fallback to Telegram.
+ */
+async function sendImageToActiveChannel(imagePath, caption) {
+  const listener = _runtime && _runtime.listener;
+  const activeType = listener ? listener.type : '';
+
+  if (activeType === 'wecom') {
+    if (listener.sendImage) return listener.sendImage(imagePath, caption);
+    console.warn('[Image] WeCom is active but sendImage is unavailable');
+    return null;
+  }
+
+  if (activeType === 'telegram') {
+    if (listener.sendImage) return listener.sendImage(imagePath, caption);
+    return sendTelegramPhoto(imagePath, caption);
+  }
+
+  // Fallback only when no active bidirectional listener is present.
+  return sendTelegramPhoto(imagePath, caption);
+}
+
 // ─── Self-Restart (Workflow Re-dispatch) ────────────────────────────
 
 /**
@@ -663,13 +767,9 @@ function createBuiltinTools(repoStore, llm, notifyFn) {
     }));
 
     // 6. Write Repo File — write/update a file in the GitHub repository
-    //    Certain paths must stay plain text (workflow YAML, executable scripts,
-    //    crypto helpers) so GitHub Actions can read/execute them.
+    //    Workflow YAML files must stay plain text so GitHub Actions can read them.
     const PLAIN_TEXT_PATTERNS = [
       /^\.github\/workflows\/.+\.ya?ml$/,      // GHA workflow definitions
-      /^loop-agent\/schedules\/.+\.(js|py)$/,   // scheduled task scripts
-      /^loop-agent\/schedules\/_crypto\.js$/,    // crypto helper
-      /^loop-agent\/schedules\/_callback\.js$/,  // callback helper
     ];
     function shouldSkipEncryption(filePath) {
       return PLAIN_TEXT_PATTERNS.some(re => re.test(filePath));
@@ -687,7 +787,7 @@ function createBuiltinTools(repoStore, llm, notifyFn) {
       }
     }, {
       name: 'write_repo_file',
-      description: 'Write or update a file in the GitHub repository. Workflow YAML files (.github/workflows/*.yml) and scheduled task scripts are always stored as plain text so GitHub Actions can execute them; all other files are encrypted if an encryption key is configured.',
+      description: 'Write or update a file in the GitHub repository. Workflow YAML files (.github/workflows/*.yml) are always stored as plain text; all other files are encrypted if an encryption key is configured.',
       schema: z.object({
         path: z.string().describe('File path relative to repo root'),
         content: z.string().describe('File content to write'),
@@ -1035,9 +1135,9 @@ function createBuiltinTools(repoStore, llm, notifyFn) {
         throw new Error(`Screenshot validation failed: ${metaErr.message}`);
       }
 
-      // Send screenshot to user via Telegram
-      const telegramResult = await sendTelegramPhoto(filepath, `📸 <b>${domain}</b>\n${url.slice(0, 80)}${url.length > 80 ? '...' : ''}`);
-      console.log(`[Screenshot] Telegram: ${telegramResult ? '✓ sent' : '✗ skipped'}`);
+      // Send screenshot to user via active channel (Telegram/WeCom)
+      const imageSendResult = await sendImageToActiveChannel(filepath, `📸 ${domain}\n${url.slice(0, 80)}${url.length > 80 ? '...' : ''}`);
+      console.log(`[Screenshot] Image delivery: ${imageSendResult ? '✓ sent' : '✗ skipped'}`);
 
       // Get brief AI summary using vision API
       let summary = '';
@@ -1083,7 +1183,7 @@ function createBuiltinTools(repoStore, llm, notifyFn) {
             qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
             kimi: 'https://api.moonshot.cn/v1',
           };
-          const baseURL = baseURLMap[provider] || baseURLMap.qwen;
+          const baseURL = process.env.AI_BASE_URL || baseURLMap[provider] || baseURLMap.qwen;
           const visionModel = provider === 'qwen' ? 'qwen-vl-max' : model;
           const resp = await fetch(`${baseURL}/chat/completions`, {
             method: 'POST',
@@ -1115,7 +1215,7 @@ function createBuiltinTools(repoStore, llm, notifyFn) {
       console.log(`[Screenshot] ✓ SUCCESS`);
       console.log(`[Screenshot] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
-      const parts = [`Screenshot of ${url} captured and sent to user via Telegram.`];
+      const parts = [`Screenshot of ${url} captured and sent to user via active channel.`];
       if (summary) parts.push(`\nPage summary:\n${summary}`);
       parts.push(`\n[File: ${filepath}, ${fileSize}KB]`);
       return parts.join('');
@@ -1127,7 +1227,7 @@ function createBuiltinTools(repoStore, llm, notifyFn) {
     }
   }, {
     name: 'screenshot_page',
-    description: 'Take a full-page screenshot of a URL using Playwright. The image is automatically sent to the user via Telegram and a brief AI-generated summary is returned. Use when the user wants to see or check a web page.',
+    description: 'Take a full-page screenshot of a URL using Playwright. The image is automatically sent to the user via the active channel (Telegram or WeCom) and a brief AI-generated summary is returned. Use when the user wants to see or check a web page.',
     schema: z.object({
       url: z.string().url().describe('The URL to screenshot'),
       waitFor: z.number().optional().describe('Extra wait time in ms after page load for dynamic content (max 30000)'),
@@ -1289,8 +1389,8 @@ CROP_REGION: {"x": <left>, "y": <top>, "width": <width>, "height": <height>}`;
       const stats = fs.statSync(outputPath);
       console.log(`[Crop] Saved ${outputFilename} (${Math.round(stats.size / 1024)}KB, ${cropW}x${cropH})`);
 
-      // Send cropped image to user via Telegram
-      await sendTelegramPhoto(outputPath, `🔍 Cropped region (${cropW}x${cropH})`);
+      // Send cropped image to user via active channel (Telegram/WeCom)
+      await sendImageToActiveChannel(outputPath, `🔍 Cropped region (${cropW}x${cropH})`);
 
       return JSON.stringify({
         success: true,
@@ -1304,7 +1404,7 @@ CROP_REGION: {"x": <left>, "y": <top>, "width": <width>, "height": <height>}`;
     }
   }, {
     name: 'crop_image',
-    description: 'Crop a rectangular region from an image and send it to the user via Telegram. Use coordinates from analyze_page_visual CROP_REGION output. Coordinates are clamped to image bounds.',
+    description: 'Crop a rectangular region from an image and send it to the user via the active channel (Telegram or WeCom). Use coordinates from analyze_page_visual CROP_REGION output. Coordinates are clamped to image bounds.',
     schema: z.object({
       imagePath: z.string().describe('Absolute path to the source image'),
       x: z.number().describe('Left edge X coordinate in pixels'),
@@ -1314,338 +1414,572 @@ CROP_REGION: {"x": <left>, "y": <top>, "width": <width>, "height": <height>}`;
     }),
   }));
 
-  // ── create_scheduled_task: Create a cron-scheduled GHA workflow ────
-  tools.push(tool(async ({ name, description, cron, script, language }) => {
-    if (!repoStore) return 'Error: GitHub repo not configured, cannot create scheduled tasks.';
+  // ── create_scheduled_task: Register a cron task in the loop agent ──
+  tools.push(tool(async ({ name, description, cron, prompt }) => {
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'task';
-    const workflowFile = `scheduled-${slug}.yml`;
-    const workflowPath = `.github/workflows/${workflowFile}`;
     const taskRecordPath = `loop-agent/schedules/${slug}.json`;
-    const lang = (language || 'node').toLowerCase();
-    const setupStep = lang === 'python'
-      ? '      - uses: actions/setup-python@v5\n        with:\n          python-version: "3.12"\n      - run: pip install -r requirements.txt 2>/dev/null || true'
-      : '';
-    const runCmd = lang === 'python' ? `python loop-agent/schedules/${slug}.py` : `node loop-agent/schedules/${slug}.js`;
-    const scriptPath = `loop-agent/schedules/${slug}.${lang === 'python' ? 'py' : 'js'}`;
-    const cryptoHelperPath = 'loop-agent/schedules/_crypto.js';
-    const callbackHelperPath = 'loop-agent/schedules/_callback.js';
 
-    // Build the workflow YAML
-    // NOTE: Workflow YAML and script files are NEVER encrypted — they must be
-    // readable by GitHub Actions.  Sensitive user data (prompts, memory, etc.)
-    // stays encrypted in the repo; scripts decrypt them at runtime via
-    // LOOP_ENCRYPT_KEY and the _crypto.js helper.
-    const yaml = [
-      `# scheduled-task: ${slug}`,
-      `name: "Scheduled — ${name}"`,
-      '',
-      'on:',
-      '  schedule:',
-      `    - cron: '${cron}'`,
-      '  workflow_dispatch: {}',
-      '',
-      'jobs:',
-      '  run-and-notify:',
-      '    runs-on: ubuntu-latest',
-      '    steps:',
-      '      - uses: actions/checkout@v4',
-      setupStep,
-      `      - name: Run task`,
-      '        id: run-task',
-      '        env:',
-      '          LOOP_ENCRYPT_KEY: ${{ secrets.LOOP_ENCRYPT_KEY }}',
-      '        run: |',
-      `          ${runCmd} > /tmp/_task_output.txt 2>&1 || true`,
-      '          echo "output<<EOF" >> $GITHUB_OUTPUT',
-      '          head -c 3000 /tmp/_task_output.txt >> $GITHUB_OUTPUT',
-      '          echo "EOF" >> $GITHUB_OUTPUT',
-      '',
-      '      - name: Callback to Loop Agent',
-      '        if: always()',
-      '        env:',
-      '          UPSTASH_URL: ${{ secrets.UPSTASH_URL }}',
-      '          UPSTASH_TOKEN: ${{ secrets.UPSTASH_TOKEN }}',
-      '          LOOP_KEY: ${{ secrets.LOOP_KEY }}',
-      '          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}',
-      '          GITHUB_REPOSITORY: ${{ github.repository }}',
-      '        run: |',
-      `          OUTPUT=$(head -c 2000 /tmp/_task_output.txt 2>/dev/null || echo "(no output)")`,
-      `          node loop-agent/schedules/_callback.js "[Scheduled] ${name.replace(/"/g, '\\"')}" "$OUTPUT"`,
-      '',
-      '      - name: Notify',
-      '        if: always()',
-      '        env:',
-      '          PUSHOO_CHANNELS: ${{ secrets.PUSHOO_CHANNELS }}',
-      '        run: |',
-      '          npm install pushoo 2>/dev/null',
-      `          node -e "const p=require('pushoo').default;const ch=JSON.parse(process.env.PUSHOO_CHANNELS||'[]');const o=require('fs').readFileSync('/tmp/_task_output.txt','utf8').slice(0,2000);ch.forEach(c=>p(c.platform,{token:c.token,title:'[Scheduled] ${name.replace(/'/g, "\\'")}',content:o||'(no output)'}).catch(e=>console.warn(e.message)))"`,
-    ].filter(Boolean).join('\n') + '\n';
-
-    // Crypto helper — small CommonJS module that scheduled scripts can
-    // require('./_crypto') to decrypt encrypted repo files at runtime.
-    const cryptoHelperCode = [
-      '// _crypto.js — Decryption helper for scheduled tasks',
-      '// Usage: const { readEncryptedFile } = require("./_crypto");',
-      '//        const data = readEncryptedFile("../../loop-agent/MEMORY.md");',
-      'const crypto = require("crypto");',
-      'const fs = require("fs");',
-      'const PREFIX = "ENCRYPTED:";',
-      'function decrypt(passphrase, blob) {',
-      '  if (!blob || !blob.startsWith(PREFIX)) return blob;',
-      '  const packed = Buffer.from(blob.slice(PREFIX.length), "base64");',
-      '  const salt = packed.subarray(0, 16);',
-      '  const iv = packed.subarray(16, 28);',
-      '  const rest = packed.subarray(28);',
-      '  const tag = rest.subarray(rest.length - 16);',
-      '  const ct = rest.subarray(0, rest.length - 16);',
-      '  const key = crypto.pbkdf2Sync(passphrase, salt, 310000, 32, "sha256");',
-      '  const d = crypto.createDecipheriv("aes-256-gcm", key, iv);',
-      '  d.setAuthTag(tag);',
-      '  return d.update(ct, undefined, "utf8") + d.final("utf8");',
-      '}',
-      'function readEncryptedFile(filePath) {',
-      '  const k = process.env.LOOP_ENCRYPT_KEY;',
-      '  const c = fs.readFileSync(filePath, "utf8");',
-      '  return (k && c.startsWith(PREFIX)) ? decrypt(k, c) : c;',
-      '}',
-      'module.exports = { decrypt, readEncryptedFile, PREFIX };',
-    ].join('\n') + '\n';
-
-    // Callback helper — allows scheduled tasks to send messages to the
-    // running loop agent via Upstash (preferred) or repo file channel.
-    // The loop agent picks these up through its normal polling loop.
-    const callbackHelperCode = [
-      '// _callback.js — Communication helper for scheduled tasks',
-      '// Sends task output to the loop agent inbox so the running agent can react.',
-      '// Supports two backends: Upstash Redis (preferred) and GitHub repo file.',
-      '// Usage: node _callback.js "title" "body"',
-      '//   or:  const { sendToAgent, pollAgentReply } = require("./_callback");',
-      'const https = require("https");',
-      'const http = require("http");',
-      '',
-      'function request(url, opts, body) {',
-      '  return new Promise((resolve, reject) => {',
-      '    const mod = url.startsWith("https") ? https : http;',
-      '    const req = mod.request(url, opts, (res) => {',
-      '      let data = "";',
-      '      res.on("data", (d) => data += d);',
-      '      res.on("end", () => resolve({ status: res.statusCode, body: data }));',
-      '    });',
-      '    req.on("error", reject);',
-      '    if (body) req.write(body);',
-      '    req.end();',
-      '  });',
-      '}',
-      '',
-      'function makeMessage(text) {',
-      '  return JSON.stringify({ ts: Date.now(), from: "scheduled-task", text, extra: {}, read: false });',
-      '}',
-      '',
-      'async function upstashCmd(url, token, cmd) {',
-      '  const resp = await request(url, {',
-      '    method: "POST",',
-      '    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },',
-      '  }, JSON.stringify(cmd));',
-      '  return JSON.parse(resp.body);',
-      '}',
-      '',
-      'async function ghRead(token, repo, path) {',
-      '  const url = `https://api.github.com/repos/${repo}/contents/${path}?ref=main`;',
-      '  const resp = await request(url, {',
-      '    method: "GET",',
-      '    headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github.v3+json", "User-Agent": "loop-agent-callback" },',
-      '  });',
-      '  if (resp.status === 404) return null;',
-      '  const data = JSON.parse(resp.body);',
-      '  return { content: Buffer.from(data.content, "base64").toString("utf-8"), sha: data.sha };',
-      '}',
-      '',
-      'async function ghWrite(token, repo, path, content, message, sha) {',
-      '  const url = `https://api.github.com/repos/${repo}/contents/${path}`;',
-      '  const body = { message, content: Buffer.from(content).toString("base64"), branch: "main" };',
-      '  if (sha) body.sha = sha;',
-      '  return request(url, {',
-      '    method: "PUT",',
-      '    headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github.v3+json", "Content-Type": "application/json", "User-Agent": "loop-agent-callback" },',
-      '  }, JSON.stringify(body));',
-      '}',
-      '',
-      'async function sendToAgent(text, opts = {}) {',
-      '  const upstashUrl = process.env.UPSTASH_URL;',
-      '  const upstashToken = process.env.UPSTASH_TOKEN;',
-      '  const loopKey = process.env.LOOP_KEY;',
-      '  const ghToken = process.env.GITHUB_TOKEN;',
-      '  const repo = process.env.GITHUB_REPOSITORY;',
-      '  const msg = makeMessage(text);',
-      '',
-      '  if (upstashUrl && upstashToken && loopKey) {',
-      '    const key = `loop:${loopKey}:inbox`;',
-      '    await upstashCmd(upstashUrl, upstashToken, ["SET", key, msg]);',
-      '    console.log("[callback] Sent to Upstash inbox:", key);',
-      '    return "upstash";',
-      '  }',
-      '  if (ghToken && repo && loopKey) {',
-      '    const path = `loop-agent/channel/${loopKey}.inbox.json`;',
-      '    const existing = await ghRead(ghToken, repo, path);',
-      '    await ghWrite(ghToken, repo, path, msg, "[scheduled-task] Callback", existing ? existing.sha : undefined);',
-      '    console.log("[callback] Sent to repo inbox:", path);',
-      '    return "repo";',
-      '  }',
-      '  console.warn("[callback] No Upstash or GitHub channel configured; skipping.");',
-      '  return null;',
-      '}',
-      '',
-      'async function pollAgentReply(timeoutMs = 120000, intervalMs = 10000) {',
-      '  const upstashUrl = process.env.UPSTASH_URL;',
-      '  const upstashToken = process.env.UPSTASH_TOKEN;',
-      '  const loopKey = process.env.LOOP_KEY;',
-      '  const ghToken = process.env.GITHUB_TOKEN;',
-      '  const repo = process.env.GITHUB_REPOSITORY;',
-      '  const deadline = Date.now() + timeoutMs;',
-      '',
-      '  while (Date.now() < deadline) {',
-      '    try {',
-      '      let raw = null;',
-      '      if (upstashUrl && upstashToken && loopKey) {',
-      '        const key = `loop:${loopKey}:outbox`;',
-      '        const resp = await upstashCmd(upstashUrl, upstashToken, ["GET", key]);',
-      '        raw = resp.result;',
-      '      } else if (ghToken && repo && loopKey) {',
-      '        const path = `loop-agent/channel/${loopKey}.outbox.json`;',
-      '        const file = await ghRead(ghToken, repo, path);',
-      '        if (file) raw = file.content;',
-      '      }',
-      '      if (raw) {',
-      '        const msg = typeof raw === "string" ? JSON.parse(raw) : raw;',
-      '        if (msg && msg.text && !msg.read) {',
-      '          console.log("[callback] Agent replied:", msg.text.slice(0, 200));',
-      '          return msg;',
-      '        }',
-      '      }',
-      '    } catch (e) { console.warn("[callback] Poll error:", e.message); }',
-      '    await new Promise(r => setTimeout(r, intervalMs));',
-      '  }',
-      '  console.log("[callback] No reply within timeout.");',
-      '  return null;',
-      '}',
-      '',
-      '// CLI mode: node _callback.js "title" "body"',
-      'if (require.main === module) {',
-      '  const title = process.argv[2] || "Scheduled Task";',
-      '  const body = process.argv[3] || "";',
-      '  sendToAgent(`${title}\\n${body}`).then(ch => {',
-      '    console.log("[callback] Done via", ch || "none");',
-      '  }).catch(e => {',
-      '    console.error("[callback] Error:", e.message);',
-      '    process.exit(1);',
-      '  });',
-      '}',
-      '',
-      'module.exports = { sendToAgent, pollAgentReply, makeMessage };',
-    ].join('\n') + '\n';
-
-    try {
-      // Write executable files WITHOUT encryption — GHA must be able to read them
-      await repoStore.writeFileRaw(scriptPath, script, `[scheduled] Add script for ${name}`);
-      await repoStore.writeFileRaw(workflowPath, yaml, `[scheduled] Create schedule for ${name}`);
-
-      // Write shared crypto helper (plain text) so scripts can decrypt user data
-      if (repoStore._encryptKey) {
-        await repoStore.writeFileRaw(cryptoHelperPath, cryptoHelperCode, '[scheduled] Add/update crypto helper');
-      }
-
-      // Write callback helper (plain text) for scheduled task → loop agent communication
-      await repoStore.writeFileRaw(callbackHelperPath, callbackHelperCode, '[scheduled] Add/update callback helper');
-
-      // Create/update task record
-      let record = { name, slug, description, cron, language: lang, createdAt: new Date().toISOString(), executions: [] };
-      try {
-        const existing = await repoStore.readFile(taskRecordPath);
-        if (existing) record = JSON.parse(existing.content);
-      } catch { /* new record */ }
-      record.cron = cron;
-      record.description = description;
-      record.updatedAt = new Date().toISOString();
-      await repoStore.writeFile(taskRecordPath, JSON.stringify(record, null, 2), `[scheduled] Update record for ${name}`);
-
-      // Immediately trigger the workflow via workflow_dispatch so the user
-      // doesn't have to wait for the next cron tick.
-      let triggerMsg = '';
-      try {
-        const dispatchResp = await fetch(
-          `${repoStore.api}/repos/${repoStore.owner}/${repoStore.repo}/actions/workflows/${workflowFile}/dispatches`,
-          {
-            method: 'POST',
-            headers: repoStore._headers(),
-            body: JSON.stringify({ ref: 'main' }),
-          }
-        );
-        if (dispatchResp.status === 204 || dispatchResp.ok) {
-          triggerMsg = '\n\n✅ The workflow has been triggered immediately for its first run.';
-        } else {
-          triggerMsg = `\n\n⚠️ Auto-trigger returned HTTP ${dispatchResp.status}. You can trigger it manually via workflow_dispatch.`;
-        }
-      } catch (triggerErr) {
-        triggerMsg = `\n\n⚠️ Auto-trigger failed: ${triggerErr.message}. You can trigger it manually via workflow_dispatch.`;
-      }
-
-      return `Scheduled task "${name}" created successfully.\n- Cron: ${cron}\n- Workflow: ${workflowPath}\n- Script: ${scriptPath}\n- Record: ${taskRecordPath}${triggerMsg}`;
-    } catch (e) {
-      return `Failed to create scheduled task: ${e.message}`;
+    // Validate basic cron format (5 fields)
+    const cronFields = cron.trim().split(/\s+/);
+    if (cronFields.length !== 5) {
+      return `Error: cron expression must have exactly 5 fields (min hour dom month dow). Got: "${cron}"`;
     }
+
+    const record = {
+      name, slug, description, cron, prompt,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastRunAt: null,
+      executions: [],
+    };
+
+    // Persist task record to repo (so it survives restarts)
+    if (repoStore) {
+      try {
+        await repoStore.writeFile(taskRecordPath, JSON.stringify(record, null, 2), `[scheduled] Create task ${name}`);
+      } catch (e) {
+        return `Failed to save task record: ${e.message}`;
+      }
+    }
+
+    // Register in the in-process scheduler so it fires immediately
+    _scheduleManager.register(record);
+
+    return `Scheduled task "${name}" created.\n- Cron: ${cron}\n- Record: ${taskRecordPath}\n\nThe loop agent will execute this task on schedule and notify you via configured channels.`;
   }, {
     name: 'create_scheduled_task',
-    description: 'Create a scheduled task for the loop agent to execute periodically on a cron schedule. The script will run in GitHub Actions, and its output is automatically sent to the loop agent\'s inbox, which then notifies the user via configured channels (Telegram, email, etc.). Do NOT include notification code in the script—the callback system handles delivery automatically. Use this to set up recurring agent tasks like periodic data fetches, reports, or monitoring.',
+    description: 'Create a scheduled task that the loop agent executes internally on a cron schedule. When the time comes, the agent processes the given prompt as if a user sent it and delivers the result to configured notification channels (Telegram, email, etc.). No GitHub Actions involved.',
     schema: z.object({
       name: z.string().describe('Human-readable task name (e.g. "Daily Weather Report")'),
       description: z.string().describe('Brief description of what this task does'),
-      cron: z.string().describe('Cron expression in 5-field format (e.g. "0 9 * * *" for daily at 9:00 UTC)'),
-      script: z.string().describe('The complete script code to run on each execution'),
-      language: z.enum(['node', 'python']).describe('Script language: "node" or "python"'),
+      cron: z.string().describe('Cron expression in 5-field UTC format (e.g. "0 9 * * *" for daily at 09:00 UTC)'),
+      prompt: z.string().describe('The prompt the agent should process on each execution (e.g. "Summarize the top 3 AI news stories today")'),
     }),
   }));
 
-  // ── list_scheduled_tasks: List all scheduled task records ──────────
+  // ── list_scheduled_tasks: List all registered scheduled tasks ──────
   tools.push(tool(async () => {
-    if (!repoStore) return 'Error: GitHub repo not configured.';
-    try {
-      // List files in loop-agent/schedules/ directory
-      const resp = await fetch(
-        `${repoStore.api}/repos/${repoStore.owner}/${repoStore.repo}/contents/loop-agent/schedules?ref=main`,
-        { headers: repoStore._headers() }
-      );
-      if (resp.status === 404) return 'No scheduled tasks found.';
-      if (!resp.ok) return `Failed to list tasks: HTTP ${resp.status}`;
-      const files = await resp.json();
-      const records = files.filter(f => f.name.endsWith('.json'));
-      if (records.length === 0) return 'No scheduled task records found.';
+    // First show in-memory tasks (fastest, always up-to-date)
+    const memTasks = _scheduleManager.getAll();
 
-      const tasks = [];
-      for (const rec of records) {
-        try {
-          const data = await repoStore.readFile(`loop-agent/schedules/${rec.name}`);
-          if (data) {
-            const task = JSON.parse(data.content);
-            const lastExec = task.executions?.length > 0 ? task.executions[task.executions.length - 1] : null;
-            tasks.push(`- **${task.name}** (cron: \`${task.cron}\`)\n  ${task.description || ''}\n  Last run: ${lastExec ? lastExec.timestamp + ' — ' + (lastExec.summary || 'no summary') : 'never'}`);
+    // Also scan repo for any tasks not yet loaded into memory
+    if (repoStore) {
+      try {
+        const resp = await fetch(
+          `${repoStore.api}/repos/${repoStore.owner}/${repoStore.repo}/contents/loop-agent/schedules?ref=main`,
+          { headers: repoStore._headers() }
+        );
+        if (resp.ok) {
+          const files = await resp.json();
+          for (const f of files.filter(f => f.name.endsWith('.json'))) {
+            const slug = f.name.replace('.json', '');
+            if (!_scheduleManager.get(slug)) {
+              try {
+                const data = await repoStore.readFile(`loop-agent/schedules/${f.name}`);
+                if (data) {
+                  const rec = JSON.parse(data.content);
+                  if (rec.deleted === true) continue;
+                  if (rec.slug && rec.cron && rec.prompt) {
+                    _scheduleManager.register(rec);
+                  }
+                }
+              } catch { /* skip corrupted */ }
+            }
           }
-        } catch { /* skip corrupted records */ }
-      }
-      return tasks.length > 0 ? `## Scheduled Tasks\n\n${tasks.join('\n\n')}` : 'No valid task records found.';
-    } catch (e) {
-      return `Failed to list tasks: ${e.message}`;
+        }
+      } catch { /* non-fatal */ }
     }
+
+    const all = _scheduleManager.getAll();
+    if (all.length === 0) return 'No scheduled tasks. Use create_scheduled_task to add one.';
+
+    const lines = all.map(t => {
+      const last = t.lastRunAt ? new Date(t.lastRunAt).toISOString() : 'never';
+      return `- **${t.name}** (slug: \`${t.slug}\`)\n  Cron: \`${t.cron}\`\n  ${t.description || ''}\n  Prompt: ${t.prompt.slice(0, 120)}${t.prompt.length > 120 ? '...' : ''}\n  Last run: ${last}`;
+    });
+    return `## Scheduled Tasks (${all.length})\n\n${lines.join('\n\n')}`;
   }, {
     name: 'list_scheduled_tasks',
-    description: 'List all scheduled tasks created by this agent, showing their cron schedule, description, and last execution summary.',
+    description: 'List all scheduled tasks registered with the loop agent, showing their cron schedule, prompt, and last execution time.',
     schema: z.object({}),
   }));
+
+  // ── delete_scheduled_task: Remove a scheduled task ────────────────
+  tools.push(tool(async ({ slug }) => {
+    const removedFromMemory = _scheduleManager.unregister(slug);
+    let removedFromRepo = false;
+
+    // Always attempt repo deletion; the task might not be loaded in memory yet.
+    if (repoStore) {
+      try {
+        const path = `loop-agent/schedules/${slug}.json`;
+        const del = await repoStore.deleteFile(path, `[scheduled] Delete task ${slug}`);
+        removedFromRepo = !!(del && del.deleted);
+      } catch (e) {
+        // Fallback tombstone to prevent resurrection on reboot if hard delete failed.
+        try {
+          const path = `loop-agent/schedules/${slug}.json`;
+          const tombstone = {
+            slug,
+            deleted: true,
+            deletedAt: new Date().toISOString(),
+          };
+          await repoStore.writeFile(path, JSON.stringify(tombstone, null, 2), `[scheduled] Tombstone task ${slug}`);
+          removedFromRepo = true;
+        } catch {
+          return `Failed to delete task "${slug}": ${e.message}`;
+        }
+      }
+    }
+
+    if (!removedFromMemory && !removedFromRepo) {
+      return `No task found with slug "${slug}". Use list_scheduled_tasks to see available tasks.`;
+    }
+
+    return `Scheduled task "${slug}" has been removed and will no longer run.`;
+  }, {
+    name: 'delete_scheduled_task',
+    description: 'Delete a scheduled task so it no longer runs. Use list_scheduled_tasks first to get the slug.',
+    schema: z.object({
+      slug: z.string().describe('The task slug to delete (shown in list_scheduled_tasks output)'),
+    }),
+  }));
+
+  // ── GitHub API Tools ──────────────────────────────────────────────
+  // Dedicated GitHub REST API tools that use GH_PAT directly.
+  // These MUST be used for all GitHub operations instead of browser/fetch_url
+  // to avoid conflicts with browser-based tools.
+
+  const ghPat = process.env.GH_PAT;
+  const ghRepo = process.env.GITHUB_REPOSITORY; // owner/repo
+  if (ghPat) {
+    const ghHeaders = (pat) => ({
+      Authorization: `Bearer ${pat}`,
+      Accept: 'application/vnd.github.v3+json',
+      'Content-Type': 'application/json',
+    });
+
+    // Helper: resolve owner/repo — uses provided target_repo or falls back to session repo
+    const resolveRepo = (targetRepo) => {
+      const repo = targetRepo || ghRepo;
+      if (!repo || !repo.includes('/')) return null;
+      const [owner, name] = repo.split('/');
+      return { owner, name, full: repo };
+    };
+
+    // gh.1 List Issues
+    tools.push(tool(async ({ target_repo, state, labels, per_page }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified and no default GITHUB_REPOSITORY.';
+      try {
+        const params = new URLSearchParams();
+        if (state) params.set('state', state);
+        if (labels) params.set('labels', labels);
+        params.set('per_page', String(per_page || 10));
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/issues?${params}`,
+          { headers: ghHeaders(ghPat) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const issues = await resp.json();
+        if (issues.length === 0) return `No issues found in ${r.full} (state: ${state || 'open'}).`;
+        return issues.map(i =>
+          `#${i.number} [${i.state}] ${i.title}${i.labels.length ? ' (' + i.labels.map(l => l.name).join(', ') + ')' : ''} — ${i.user.login}`
+        ).join('\n');
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_list_issues',
+      description: 'List issues in a GitHub repository. Defaults to the session repo if target_repo is omitted.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo (e.g. "octocat/Hello-World"). Defaults to session repo.'),
+        state: z.enum(['open', 'closed', 'all']).optional().describe('Filter by state (default: open)'),
+        labels: z.string().optional().describe('Comma-separated label names to filter by'),
+        per_page: z.number().optional().describe('Results per page (default: 10, max: 100)'),
+      }),
+    }));
+
+    // gh.2 Create Issue
+    tools.push(tool(async ({ target_repo, title, body, labels, assignees }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified and no default GITHUB_REPOSITORY.';
+      try {
+        const payload = { title };
+        if (body) payload.body = body;
+        if (labels) payload.labels = labels.split(',').map(l => l.trim());
+        if (assignees) payload.assignees = assignees.split(',').map(a => a.trim());
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/issues`,
+          { method: 'POST', headers: ghHeaders(ghPat), body: JSON.stringify(payload) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const issue = await resp.json();
+        return `Issue #${issue.number} created: ${issue.html_url}`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_create_issue',
+      description: 'Create a new issue in a GitHub repository.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo. Defaults to session repo.'),
+        title: z.string().describe('Issue title'),
+        body: z.string().optional().describe('Issue body (Markdown supported)'),
+        labels: z.string().optional().describe('Comma-separated label names'),
+        assignees: z.string().optional().describe('Comma-separated GitHub usernames to assign'),
+      }),
+    }));
+
+    // gh.3 Update Issue (edit title/body/state/labels)
+    tools.push(tool(async ({ target_repo, issue_number, title, body, state, labels }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const payload = {};
+        if (title) payload.title = title;
+        if (body) payload.body = body;
+        if (state) payload.state = state;
+        if (labels) payload.labels = labels.split(',').map(l => l.trim());
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/issues/${issue_number}`,
+          { method: 'PATCH', headers: ghHeaders(ghPat), body: JSON.stringify(payload) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const issue = await resp.json();
+        return `Issue #${issue.number} updated (state: ${issue.state}): ${issue.html_url}`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_update_issue',
+      description: 'Update an existing issue — change title, body, state (open/closed), or labels.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        issue_number: z.number().describe('Issue number'),
+        title: z.string().optional().describe('New title'),
+        body: z.string().optional().describe('New body'),
+        state: z.enum(['open', 'closed']).optional().describe('Set issue state'),
+        labels: z.string().optional().describe('Replace labels (comma-separated)'),
+      }),
+    }));
+
+    // gh.4 Comment on Issue/PR
+    tools.push(tool(async ({ target_repo, issue_number, body }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/issues/${issue_number}/comments`,
+          { method: 'POST', headers: ghHeaders(ghPat), body: JSON.stringify({ body }) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const comment = await resp.json();
+        return `Comment added to #${issue_number}: ${comment.html_url}`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_comment_issue',
+      description: 'Add a comment to an issue or pull request.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        issue_number: z.number().describe('Issue or PR number'),
+        body: z.string().describe('Comment body (Markdown supported)'),
+      }),
+    }));
+
+    // gh.5 List Pull Requests
+    tools.push(tool(async ({ target_repo, state, per_page }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const params = new URLSearchParams();
+        if (state) params.set('state', state);
+        params.set('per_page', String(per_page || 10));
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/pulls?${params}`,
+          { headers: ghHeaders(ghPat) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const prs = await resp.json();
+        if (prs.length === 0) return `No pull requests found in ${r.full} (state: ${state || 'open'}).`;
+        return prs.map(p =>
+          `#${p.number} [${p.state}${p.merged_at ? '/merged' : ''}] ${p.title} (${p.head.ref} → ${p.base.ref}) — ${p.user.login}`
+        ).join('\n');
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_list_pulls',
+      description: 'List pull requests in a GitHub repository.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        state: z.enum(['open', 'closed', 'all']).optional().describe('Filter by state (default: open)'),
+        per_page: z.number().optional().describe('Results per page (default: 10, max: 100)'),
+      }),
+    }));
+
+    // gh.6 Create Pull Request
+    tools.push(tool(async ({ target_repo, title, body, head, base }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/pulls`,
+          { method: 'POST', headers: ghHeaders(ghPat), body: JSON.stringify({ title, body: body || '', head, base }) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const pr = await resp.json();
+        return `PR #${pr.number} created: ${pr.html_url}`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_create_pull',
+      description: 'Create a new pull request.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        title: z.string().describe('PR title'),
+        body: z.string().optional().describe('PR description (Markdown)'),
+        head: z.string().describe('Head branch name (the branch with changes)'),
+        base: z.string().describe('Base branch name (target, e.g. "main")'),
+      }),
+    }));
+
+    // gh.7 Merge Pull Request
+    tools.push(tool(async ({ target_repo, pull_number, merge_method, commit_title }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const payload = {};
+        if (merge_method) payload.merge_method = merge_method;
+        if (commit_title) payload.commit_title = commit_title;
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/pulls/${pull_number}/merge`,
+          { method: 'PUT', headers: ghHeaders(ghPat), body: JSON.stringify(payload) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const result = await resp.json();
+        return `PR #${pull_number} merged: ${result.message}`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_merge_pull',
+      description: 'Merge a pull request.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        pull_number: z.number().describe('PR number'),
+        merge_method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Merge strategy (default: merge)'),
+        commit_title: z.string().optional().describe('Custom merge commit title'),
+      }),
+    }));
+
+    // gh.8 List Branches
+    tools.push(tool(async ({ target_repo, per_page }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/branches?per_page=${per_page || 30}`,
+          { headers: ghHeaders(ghPat) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const branches = await resp.json();
+        return branches.map(b => `${b.name}${b.protected ? ' 🔒' : ''}`).join('\n');
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_list_branches',
+      description: 'List branches in a GitHub repository.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        per_page: z.number().optional().describe('Results per page (default: 30)'),
+      }),
+    }));
+
+    // gh.9 Create Branch
+    tools.push(tool(async ({ target_repo, branch_name, from_branch }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        // Get SHA of source branch
+        const refResp = await fetch(
+          `https://api.github.com/repos/${r.full}/git/ref/heads/${from_branch || 'main'}`,
+          { headers: ghHeaders(ghPat) }
+        );
+        if (!refResp.ok) return `Source branch not found: ${await refResp.text()}`;
+        const sha = (await refResp.json()).object.sha;
+        // Create new ref
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/git/refs`,
+          { method: 'POST', headers: ghHeaders(ghPat), body: JSON.stringify({ ref: `refs/heads/${branch_name}`, sha }) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        return `Branch "${branch_name}" created from ${from_branch || 'main'} (SHA: ${sha.slice(0, 7)})`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_create_branch',
+      description: 'Create a new branch from an existing branch.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        branch_name: z.string().describe('New branch name'),
+        from_branch: z.string().optional().describe('Source branch (default: main)'),
+      }),
+    }));
+
+    // gh.10 List Repos (for the authenticated user)
+    tools.push(tool(async ({ type, sort, per_page }) => {
+      try {
+        const params = new URLSearchParams();
+        if (type) params.set('type', type);
+        if (sort) params.set('sort', sort);
+        params.set('per_page', String(per_page || 10));
+        const resp = await fetch(
+          `https://api.github.com/user/repos?${params}`,
+          { headers: ghHeaders(ghPat) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const repos = await resp.json();
+        if (repos.length === 0) return 'No repositories found.';
+        return repos.map(r =>
+          `${r.full_name}${r.private ? ' 🔒' : ''} — ${r.description || '(no description)'}  ⭐${r.stargazers_count}`
+        ).join('\n');
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_list_repos',
+      description: 'List GitHub repositories for the authenticated user.',
+      schema: z.object({
+        type: z.enum(['all', 'owner', 'public', 'private', 'member']).optional().describe('Repo type filter'),
+        sort: z.enum(['created', 'updated', 'pushed', 'full_name']).optional().describe('Sort order'),
+        per_page: z.number().optional().describe('Results per page (default: 10)'),
+      }),
+    }));
+
+    // gh.11 Create Repository
+    tools.push(tool(async ({ name, description, is_private, auto_init }) => {
+      try {
+        const payload = { name, private: is_private || false, auto_init: auto_init !== false };
+        if (description) payload.description = description;
+        const resp = await fetch(
+          'https://api.github.com/user/repos',
+          { method: 'POST', headers: ghHeaders(ghPat), body: JSON.stringify(payload) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const repo = await resp.json();
+        return `Repository created: ${repo.html_url}`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_create_repo',
+      description: 'Create a new GitHub repository for the authenticated user.',
+      schema: z.object({
+        name: z.string().describe('Repository name'),
+        description: z.string().optional().describe('Repository description'),
+        is_private: z.boolean().optional().describe('Create as private repo (default: false)'),
+        auto_init: z.boolean().optional().describe('Initialize with README (default: true)'),
+      }),
+    }));
+
+    // gh.12 Get File Content (from any repo)
+    tools.push(tool(async ({ target_repo, path, ref }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const url = `https://api.github.com/repos/${r.full}/contents/${path}${ref ? '?ref=' + ref : ''}`;
+        const resp = await fetch(url, { headers: ghHeaders(ghPat) });
+        if (resp.status === 404) return `File not found: ${path} in ${r.full}`;
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const data = await resp.json();
+        if (Array.isArray(data)) {
+          // It's a directory
+          return data.map(f => `${f.type === 'dir' ? '📁' : '📄'} ${f.name} (${f.type})`).join('\n');
+        }
+        const content = Buffer.from(data.content, 'base64').toString('utf-8');
+        return content.slice(0, 8000) + (content.length > 8000 ? '\n...(truncated)' : '');
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_get_content',
+      description: 'Get file content or list directory from any accessible GitHub repository. For the session repo, prefer read_repo_file instead.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        path: z.string().describe('File or directory path'),
+        ref: z.string().optional().describe('Branch/tag/SHA (default: default branch)'),
+      }),
+    }));
+
+    // gh.13 List Workflow Runs
+    tools.push(tool(async ({ target_repo, status, per_page }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const params = new URLSearchParams();
+        if (status) params.set('status', status);
+        params.set('per_page', String(per_page || 10));
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/actions/runs?${params}`,
+          { headers: ghHeaders(ghPat) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const data = await resp.json();
+        if (!data.workflow_runs || data.workflow_runs.length === 0) return `No workflow runs found.`;
+        return data.workflow_runs.map(run =>
+          `#${run.id} [${run.status}/${run.conclusion || 'pending'}] ${run.name} — ${run.head_branch} (${new Date(run.created_at).toISOString()})`
+        ).join('\n');
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_list_runs',
+      description: 'List GitHub Actions workflow runs for a repository.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        status: z.enum(['completed', 'action_required', 'cancelled', 'failure', 'neutral', 'skipped', 'stale', 'success', 'timed_out', 'in_progress', 'queued', 'requested', 'waiting', 'pending']).optional().describe('Filter by run status'),
+        per_page: z.number().optional().describe('Results per page (default: 10)'),
+      }),
+    }));
+
+    // gh.14 Dispatch Workflow
+    tools.push(tool(async ({ target_repo, workflow_id, ref, inputs }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const payload = { ref: ref || 'main' };
+        if (inputs) {
+          try { payload.inputs = typeof inputs === 'string' ? JSON.parse(inputs) : inputs; } catch { /* ignore */ }
+        }
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/actions/workflows/${workflow_id}/dispatches`,
+          { method: 'POST', headers: ghHeaders(ghPat), body: JSON.stringify(payload) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        return `Workflow "${workflow_id}" dispatched on ${ref || 'main'}.`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_dispatch_workflow',
+      description: 'Trigger a GitHub Actions workflow via workflow_dispatch event.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        workflow_id: z.string().describe('Workflow file name (e.g. "ci.yml") or numeric ID'),
+        ref: z.string().optional().describe('Git ref to run on (default: main)'),
+        inputs: z.string().optional().describe('Workflow inputs as JSON string'),
+      }),
+    }));
+
+    // gh.15 Add Labels to Issue/PR
+    tools.push(tool(async ({ target_repo, issue_number, labels }) => {
+      const r = resolveRepo(target_repo);
+      if (!r) return 'Error: No target repo specified.';
+      try {
+        const resp = await fetch(
+          `https://api.github.com/repos/${r.full}/issues/${issue_number}/labels`,
+          { method: 'POST', headers: ghHeaders(ghPat), body: JSON.stringify({ labels: labels.split(',').map(l => l.trim()) }) }
+        );
+        if (!resp.ok) return `GitHub API error ${resp.status}: ${await resp.text()}`;
+        const result = await resp.json();
+        return `Labels updated on #${issue_number}: ${result.map(l => l.name).join(', ')}`;
+      } catch (e) { return `Failed: ${e.message}`; }
+    }, {
+      name: 'github_add_labels',
+      description: 'Add labels to a GitHub issue or pull request.',
+      schema: z.object({
+        target_repo: z.string().optional().describe('owner/repo'),
+        issue_number: z.number().describe('Issue or PR number'),
+        labels: z.string().describe('Comma-separated label names to add'),
+      }),
+    }));
+
+    console.log(`[Tools] GitHub API tools registered (PAT: ${ghPat.slice(0, 4)}***${ghPat.slice(-4)})`);
+  }
 
   // ── Browser Agent tool (ReAct browser automation) ──
   if (llm) {
     try {
       const { createBrowserTool } = require('./browser-agent');
-      tools.push(createBrowserTool(llm, notifyFn, sendTelegramPhoto));
+      tools.push(createBrowserTool(llm, notifyFn, sendImageToActiveChannel));
     } catch (e) {
       console.warn(`[Tools] browser-agent not available: ${e.message}`);
     }
@@ -1655,7 +1989,7 @@ CROP_REGION: {"x": <left>, "y": <top>, "width": <width>, "height": <height>}`;
   if (llm) {
     try {
       const { createExplorerTool } = require('./sub-agent');
-      tools.push(createExplorerTool(llm, repoStore, notifyFn, sendTelegramPhoto));
+      tools.push(createExplorerTool(llm, repoStore, notifyFn, sendImageToActiveChannel));
     } catch (e) {
       console.warn(`[Tools] sub-agent not available: ${e.message}`);
     }
@@ -1687,18 +2021,37 @@ function extractTextContent(content) {
 function createLLM(provider, model, apiKey) {
   if (provider === 'gemini') {
     const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
-    return new ChatGoogleGenerativeAI({ model, apiKey, maxRetries: 2 });
+    const resolvedGeminiKey = apiKey || process.env.AI_API_KEY || process.env.GEMINI_API_KEY || '';
+    if (!resolvedGeminiKey) {
+      throw new Error('Missing API key for gemini. Set AI_API_KEY (or GEMINI_API_KEY).');
+    }
+    return new ChatGoogleGenerativeAI({ model, apiKey: resolvedGeminiKey, maxRetries: 2 });
   }
-  // For qwen/kimi/other OpenAI-compatible providers
+  // For qwen/kimi/openai/other OpenAI-compatible providers
   const { ChatOpenAI } = require('@langchain/openai');
   const baseURLMap = {
     qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     kimi: 'https://api.moonshot.cn/v1',
+    openai: 'https://api.openai.com/v1',
   };
+  const resolvedApiKey = (
+    apiKey ||
+    process.env.AI_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    process.env.QWEN_API_KEY ||
+    process.env.KIMI_API_KEY ||
+    ''
+  );
+  if (!resolvedApiKey) {
+    throw new Error(`Missing API key for ${provider}. Set AI_API_KEY (or OPENAI_API_KEY).`);
+  }
+
+  const baseURL = process.env.AI_BASE_URL || baseURLMap[provider] || baseURLMap.openai;
   return new ChatOpenAI({
     model,
-    openAIApiKey: apiKey,
-    configuration: { baseURL: baseURLMap[provider] || baseURLMap.qwen },
+    apiKey: resolvedApiKey,
+    openAIApiKey: resolvedApiKey,
+    configuration: { baseURL },
     maxRetries: 2,
   });
 }
@@ -1923,29 +2276,46 @@ class AgentGraph {
     const defaultPrompt = `You are a helpful AI assistant running as a persistent loop agent in GitHub Actions.
 
 Available tools:
-- fetch_url: PREFERRED for ALL HTTP/API calls. Supports custom method, headers (Authorization, etc.), and JSON body.
+- fetch_url: Fetch any URL or call non-GitHub API endpoints. Supports custom HTTP methods, headers, and JSON body.
 - web_search: Search the internet for information.
 - run_shell: Execute BASH commands only (curl, git, apt-get, file ops). NOT for Python/JS code.
 - run_js: Execute JavaScript in a sandboxed VM.
 - current_datetime: Get current time.
-- read_repo_file / write_repo_file: Read/write files in the GitHub repo.
+- read_repo_file / write_repo_file: Read/write files in the SESSION GitHub repo.
 - save_memory / read_memory: Persistent key-value memory across conversations.
-- search_skills: Unified search across built-in skill catalog AND ClawHub community registry. Use when current tools cannot complete a task.
-- load_skill: Load a skill by URL, built-in name, or ClawHub slug. Skills are activated automatically via the skill router.
-- clawhub_skill_detail: Inspect a ClawHub skill's safety, author, and changelog before loading.
-- screenshot_page: Take a full-page screenshot of a URL, automatically send it to the user via Telegram, and return a brief AI-generated summary.
-- analyze_page_visual: Send a screenshot to the AI vision model for detailed layout analysis. Returns crop coordinates for important regions.
-- crop_image: Crop a region from an image and send it to the user via Telegram.
-- explore_task: Launch the Explorer sub-agent for complex tasks. For browser tasks it uses a ReAct loop (Observe → Think → Act → Verify) with atomic actions, avoiding full script generation. For non-browser tasks it generates and executes custom code. Use when no existing tool fits, a tool failed, or the task requires multi-step browser automation.
+- search_skills: Unified search across built-in skill catalog AND ClawHub community registry.
+- load_skill: Load a skill by URL, built-in name, or ClawHub slug.
+- clawhub_skill_detail: Inspect a ClawHub skill before loading.
+- screenshot_page: Take a full-page screenshot of a URL, send it to user via active channel (Telegram/WeCom).
+- analyze_page_visual: Detailed visual analysis of a screenshot.
+- crop_image: Crop a region from an image and send it via active channel (Telegram/WeCom).
+- explore_task: Explorer sub-agent for complex tasks. Browser automation (ReAct loop) or code generation.
+
+GITHUB API TOOLS (use these for ALL GitHub operations):
+- github_list_issues: List issues in any repo
+- github_create_issue: Create a new issue
+- github_update_issue: Update/close an issue
+- github_comment_issue: Comment on an issue or PR
+- github_list_pulls: List pull requests
+- github_create_pull: Create a pull request
+- github_merge_pull: Merge a pull request
+- github_list_branches: List branches
+- github_create_branch: Create a new branch
+- github_list_repos: List your repositories
+- github_create_repo: Create a new repository
+- github_get_content: Get file/directory from any repo
+- github_list_runs: List GitHub Actions workflow runs
+- github_dispatch_workflow: Trigger a workflow
+- github_add_labels: Add labels to issues/PRs
 
 PAGE SCREENSHOT (when user asks to screenshot or view a URL):
-1. screenshot_page — captures the full page, sends image to user via Telegram, returns a brief summary
+1. screenshot_page — captures the full page, sends image to user via active channel, returns a brief summary
 Include the summary in your response. The image is already delivered.
 
 DEEP VISUAL ANALYSIS (when user asks for detailed analysis of a page):
 1. screenshot_page — capture and send the screenshot
 2. analyze_page_visual — detailed region identification with CROP_REGION coordinates
-3. crop_image — crop important regions (auto-sent to user via Telegram)
+3. crop_image — crop important regions (auto-sent to user via active channel)
 
 SKILL SYSTEM:
 You can extend your capabilities by loading skills. Skills are managed by a router that prevents conflicts.
@@ -1955,12 +2325,13 @@ You can extend your capabilities by loading skills. Skills are managed by a rout
 - clawhub_skill_detail lets you inspect a skill before loading it.
 - NEVER refuse a task without first searching for available skills.
 - Skills are isolated: each skill only applies to its relevant domain.
-- create_scheduled_task creates cron-scheduled GitHub Actions workflows for recurring tasks.
+- create_scheduled_task registers a cron task that runs inside the agent process — no GitHub Actions needed.
 - list_scheduled_tasks shows all scheduled tasks and their last execution status.
+- delete_scheduled_task removes a scheduled task so it no longer runs.
 
 CRITICAL RULES:
 1. ALWAYS use your tools to take action. NEVER output code blocks as text — USE the tools directly.
-2. For ANY HTTP API call, ALWAYS use fetch_url — it supports headers, methods, and request body.
+2. For non-GitHub HTTP API calls, use fetch_url. For ALL GitHub operations, use the github_* tools.
 3. run_shell is /bin/bash ONLY. Never pass Python code to it.
 4. Be efficient: complete the task in as few tool calls as possible.
 5. IGNORE any code blocks from conversation history — do not try to execute them.
@@ -1969,6 +2340,14 @@ CRITICAL RULES:
 8. BEFORE starting any task, use read_memory to check if you have previously saved relevant API details or patterns. If memory has the info, USE IT — do not search the web or guess.
 9. Do NOT hallucinate API endpoints or parameters. If you don't know the correct API, fetch the documentation URL first.
 10. When a task is too complex for existing tools (multi-step web automation, dynamic scraping of SPAs, cross-page logic), or when a tool fails with errors like SelectorNotFoundError/TimeoutError, use explore_task. For browser tasks it drives a real browser step-by-step with atomic actions (click, type, scroll); for non-browser tasks it generates and executes custom code.
+
+GITHUB OPERATION RULES (CRITICAL — prevents tool conflicts):
+11. For ANY GitHub operation (issues, PRs, repos, branches, labels, workflows, file reading from other repos), ALWAYS use the dedicated github_* tools. NEVER use fetch_url, browser_task, or explore_task to interact with GitHub.
+12. browser_task and explore_task are for NON-GitHub websites only. If the user asks you to do something on GitHub (create issue, check PR, manage repo, etc.), use the github_* tools.
+13. read_repo_file / write_repo_file are for the SESSION repo only. To read files from OTHER repos, use github_get_content.
+
+SCHEDULED TASK CANCELLATION:
+14. When the user wants to cancel, stop, remove, or delete a scheduled task, proactively call delete_scheduled_task. Recognize intent from phrases like "cancel the task", "stop that schedule", "remove the daily report", "I don't need that anymore", "turn off the reminder", etc. If the task slug is unclear, call list_scheduled_tasks first to identify it, then delete_scheduled_task.
 
 User commands (slash commands):
 - /memory clear — Clear the persistent memory file
@@ -2077,6 +2456,32 @@ User commands (slash commands):
       return this._execute(state, conversationMessages);
     }
 
+    // CODE-LEVEL OVERRIDE: If user wants to cancel/stop/remove a scheduled task, go direct.
+    const cancelSchedulePattern = /\b(cancel|stop|remove|delete|取消|停止|关闭|删除|turn\s*off|不[要需]了)\b.*\b(schedule|task|定时|任务|提醒|cron|daily|weekly|hourly|report|reminder)\b|\b(schedule|task|定时|任务|cron)\b.*\b(cancel|stop|remove|delete|取消|停止|关闭|删除|turn\s*off|不[要需]了)\b/i;
+    if (cancelSchedulePattern.test(userText)) {
+      console.log(`[Graph] Analyze → direct (schedule cancellation intent detected)`);
+      state.phase = 'analyze';
+      state.intent = 'Cancel/delete a scheduled task';
+      state.requiredParams = {};
+      state.collectedParams = {};
+      recordNodeTiming(state, 'analyze', startMs, Date.now());
+      await this._checkpoint('analyze', state);
+      return this._execute(state, conversationMessages);
+    }
+
+    // CODE-LEVEL OVERRIDE: If message references GitHub operations, go direct.
+    const githubOpPattern = /\b(issue|pull\s*request|PR|merge|branch|repo|workflow|label)\b.*\b(create|list|close|open|update|delete|check|add|remove|view|get|show)\b|\b(create|list|close|open|update|delete|check|add|remove|view|get|show)\b.*\b(issue|pull\s*request|PR|merge|branch|repo|workflow|label)\b|\bgithub\b/i;
+    if (githubOpPattern.test(userText)) {
+      console.log(`[Graph] Analyze → direct (GitHub operation detected, using github_* tools)`);
+      state.phase = 'analyze';
+      state.intent = userText;
+      state.requiredParams = {};
+      state.collectedParams = {};
+      recordNodeTiming(state, 'analyze', startMs, Date.now());
+      await this._checkpoint('analyze', state);
+      return this._execute(state, conversationMessages);
+    }
+
     // CODE-LEVEL OVERRIDE: If this is a follow-up request for a similar task
     const shortMessage = userText.length < 200;
     const recentHistory = conversationMessages.slice(-4);
@@ -2099,25 +2504,34 @@ User commands (slash commands):
 
 Available tools (these are REAL tools you can call in the execution phase):
 - web_search: Search the internet via DuckDuckGo
-- fetch_url: Fetch and read ANY URL's content (web pages, raw files, API endpoints). Supports custom HTTP methods, headers (including Authorization), and request body for API calls.
+- fetch_url: Fetch and read ANY URL's content (NON-GitHub pages, external APIs). Supports custom HTTP methods, headers, and request body.
 - run_js: Execute JavaScript code in a sandboxed VM
 - run_shell: Execute shell commands (bash) — curl, git, apt-get, jq, etc.
 - current_datetime: Get current date and time
-- read_repo_file / write_repo_file: Read/write files in the GitHub repository
+- read_repo_file / write_repo_file: Read/write files in the SESSION GitHub repository
 - save_memory / read_memory: Persistent memory storage
 - search_skills: Unified search across built-in skills and ClawHub community registry
 - load_skill: Load a skill by URL, built-in name, or ClawHub slug
 - clawhub_skill_detail: Get full details for a ClawHub skill by slug
-- explore_task: Explorer sub-agent for complex tasks — uses a ReAct browser loop for web automation or code generation for non-browser tasks
+- explore_task: Explorer sub-agent for complex tasks — uses a ReAct browser loop for non-GitHub web automation or code generation
+- github_list_issues / github_create_issue / github_update_issue / github_comment_issue: Issue operations
+- github_list_pulls / github_create_pull / github_merge_pull: PR operations
+- github_list_branches / github_create_branch: Branch operations
+- github_list_repos / github_create_repo / github_get_content: Repo operations
+- github_list_runs / github_dispatch_workflow: Actions/workflow operations
+- github_add_labels: Label management
+- create_scheduled_task / list_scheduled_tasks / delete_scheduled_task: Scheduled task management
 
 Classify the request:
 1. "direct" — Can be handled with the available tools above. This includes:
-   - Reading ANY URL or web page (use fetch_url)
-   - Making API calls with authentication (use fetch_url with headers, or run_shell with curl)
+   - Reading ANY URL or web page (use fetch_url for non-GitHub, github_get_content for GitHub)
+   - ALL GitHub operations: issues, PRs, branches, repos, workflows (use github_* tools)
+   - Making API calls with authentication (use fetch_url for non-GitHub APIs, run_shell with curl)
    - Running shell/CLI commands (use run_shell)
    - Web searches, code tasks, file operations, general conversation
-   - Tasks described in external skill/tool documents (fetch_url to read, then call their APIs)
+   - Tasks described in external skill/tool documents
    - ANY follow-up request to repeat or modify a previously successful task
+   - Cancelling, stopping, or removing a scheduled task (use delete_scheduled_task)
 2. "multi_step" — ONLY use this when the user's request genuinely requires credentials or configuration that:
    a) The user has NOT provided in any previous message, AND
    b) Cannot be obtained via the available tools above, AND
@@ -2135,7 +2549,8 @@ CRITICAL rules:
 - Default to "direct". 99% of requests should be "direct".
 - If a previous task succeeded recently, a similar follow-up is ALWAYS "direct".
 - Only classify as "multi_step" if the user explicitly needs to provide a password, API key, or account credential that they haven't mentioned yet AND cannot be in memory.
-- NEVER invent tool names that are not in the list above.`;
+- NEVER invent tool names that are not in the list above.
+- Cancelling/stopping/removing a scheduled task is ALWAYS "direct".`;
 
     const recentMessages = conversationMessages.slice(-6);
     const result = await this.llm.invoke([
@@ -2147,7 +2562,7 @@ CRITICAL rules:
     const analysis = this._parseJSON(extractTextContent(result.content));
 
     if (!analysis || analysis.type === 'direct') {
-      console.log(`[Graph] Analyze → direct (intent: ${analysis?.intent || 'N/A'})`);
+      console.log(`[Graph] Analyze → direct (intent classified)`);
       state.phase = 'analyze';
       state.intent = analysis?.intent || '';
       state.requiredParams = {};
@@ -2157,7 +2572,7 @@ CRITICAL rules:
       return this._execute(state, conversationMessages);
     }
 
-    console.log(`[Graph] Analyze → multi_step (intent: ${analysis.intent})`);
+    console.log(`[Graph] Analyze → multi_step`);
     state.intent = analysis.intent;
     state.requiredParams = analysis.required_params || {};
     state.collectedParams = analysis.collected_params || {};
@@ -2927,8 +3342,9 @@ async function processUserMessage(text, { agentGraph, graphState, history, repoS
     console.log(`[Agent] Done. Response: ${responseText.length} chars, next phase: ${graphState.phase}`);
   } catch (agentErr) {
     console.error(`[Agent] Error: ${agentErr.message}`);
-    console.error(`[Agent] Stack: ${agentErr.stack}`);
-    if (agentErr.cause) console.error(`[Agent] Cause: ${JSON.stringify(agentErr.cause)}`);
+    // Stack logged without cause to avoid leaking API payloads / message content
+    const safeStack = (agentErr.stack || '').split('\n').slice(0, 5).join('\n');
+    console.error(`[Agent] Stack (truncated):\n${safeStack}`);
     responseText = `[Error] Agent failed: ${agentErr.message}`;
     graphState.phase = 'analyze';
     graphState.lastError = { node: 'process', message: agentErr.message, ts: Date.now() };
@@ -2942,6 +3358,116 @@ async function processUserMessage(text, { agentGraph, graphState, history, repoS
 
   return { responseText };
 }
+
+// ─── Schedule Manager ───────────────────────────────────────────────
+//
+// Manages cron-scheduled tasks that run inside the loop agent process.
+// No GitHub Actions involved — the agent itself fires tasks on time.
+
+class ScheduleManager {
+  constructor() {
+    this._tasks = new Map(); // slug → task record
+  }
+
+  register(task) {
+    const entry = {
+      name: task.name,
+      slug: task.slug,
+      description: task.description || '',
+      cron: task.cron,
+      prompt: task.prompt || '',
+      lastRunAt: task.lastRunAt || null,
+      createdAt: task.createdAt || new Date().toISOString(),
+    };
+    this._tasks.set(task.slug, entry);
+    return entry;
+  }
+
+  unregister(slug) {
+    return this._tasks.delete(slug);
+  }
+
+  get(slug) { return this._tasks.get(slug); }
+
+  getAll() { return Array.from(this._tasks.values()); }
+
+  markRan(slug, now) {
+    const task = this._tasks.get(slug);
+    if (task) task.lastRunAt = now.toISOString();
+  }
+
+  /** Return all tasks whose cron fires at `now` and haven't run this minute. */
+  getDueTasks(now = new Date()) {
+    return this.getAll().filter(t => this._shouldFire(t.cron, t.lastRunAt, now));
+  }
+
+  _shouldFire(cron, lastRunAt, now) {
+    if (!this._matchesCron(cron, now)) return false;
+    if (!lastRunAt) return true;
+    const last = new Date(lastRunAt);
+    // Prevent double-firing within the same minute
+    return !(
+      last.getFullYear() === now.getFullYear() &&
+      last.getMonth()    === now.getMonth()    &&
+      last.getDate()     === now.getDate()     &&
+      last.getHours()    === now.getHours()    &&
+      last.getMinutes()  === now.getMinutes()
+    );
+  }
+
+  /**
+   * Minimal 5-field cron matcher: "min hour dom month dow"
+   * Supports: * (any), numbers, comma lists, ranges (1-5), steps (*\/5, 1-10\/2)
+   */
+  _matchesCron(expr, now) {
+    const fields = (expr || '').trim().split(/\s+/);
+    if (fields.length !== 5) return false;
+    const [minE, hourE, domE, monE, dowE] = fields;
+    return (
+      this._matchField(minE,  now.getMinutes(),     0, 59) &&
+      this._matchField(hourE, now.getHours(),        0, 23) &&
+      this._matchField(domE,  now.getDate(),         1, 31) &&
+      this._matchField(monE,  now.getMonth() + 1,   1, 12) &&
+      this._matchField(dowE,  now.getDay(),          0,  6)
+    );
+  }
+
+  _matchField(expr, value, min, max) {
+    if (expr === '*') return true;
+    for (const part of expr.split(',')) {
+      if (this._matchPart(part.trim(), value, min, max)) return true;
+    }
+    return false;
+  }
+
+  _matchPart(part, value, min, max) {
+    if (part.includes('/')) {
+      const [rangeStr, stepStr] = part.split('/');
+      const step = parseInt(stepStr, 10);
+      if (isNaN(step) || step < 1) return false;
+      let start = min, end = max;
+      if (rangeStr !== '*') {
+        if (rangeStr.includes('-')) {
+          const [a, b] = rangeStr.split('-').map(Number);
+          start = a; end = b;
+        } else {
+          start = parseInt(rangeStr, 10);
+        }
+      }
+      for (let v = start; v <= end; v += step) {
+        if (v === value) return true;
+      }
+      return false;
+    }
+    if (part.includes('-')) {
+      const [a, b] = part.split('-').map(Number);
+      return value >= a && value <= b;
+    }
+    return parseInt(part, 10) === value;
+  }
+}
+
+const _scheduleManager = new ScheduleManager();
 
 // ─── Unified Mode Lifecycle Management ──────────────────────────────
 //
@@ -2959,6 +3485,8 @@ async function processUserMessage(text, { agentGraph, graphState, history, repoS
 const _runtime = {
   listener: null,        // { type: 'telegram'|'wecom', stop(), sendMsg(text) } or null
   pollTimer: null,       // browser polling setTimeout handle
+  schedulerTimer: null,  // scheduled task ticker setTimeout handle
+  wecomActiveFrame: null,// active WeCom inbound frame used for image replies
   processing: false,     // global mutex for concurrent message processing
   processedCount: 0,     // total messages processed
   startTime: 0,          // process start timestamp
@@ -2988,14 +3516,14 @@ async function createTelegramListener(ctx) {
     console.warn(`[Telegram] Raw token (first 20 chars): ${channel.token ? channel.token.slice(0, 20) + '...' : '(empty)'}`);
     return null;
   }
-  console.log(`[Telegram] botToken length: ${botToken.length}, chatId: ${chatId || '(empty)'}`);
+  console.log(`[Telegram] botToken length: ${botToken.length}, chatId configured: ${chatId ? 'yes' : 'no'}`);
 
   const { Telegraf } = require('telegraf');
   const bot = new Telegraf(botToken);
   let stopped = false;
 
   console.log(`[Telegram] Starting listener...`);
-  console.log(`[Telegram] Chat ID: ${chatId || '(any)'}`);
+  console.log(`[Telegram] Chat ID filter: ${chatId ? 'set' : '(any)'}`);
 
   // /start
   bot.command('start', async (bctx) => {
@@ -3133,6 +3661,10 @@ async function createTelegramListener(ctx) {
         }
       } catch (e) { console.warn(`[Telegram] Forward failed: ${e.message}`); }
     },
+    async sendImage(imagePath, caption) {
+      if (stopped) return null;
+      return sendTelegramPhoto(imagePath, caption);
+    },
   };
 }
 
@@ -3229,7 +3761,7 @@ async function createWecomListener(ctx) {
     const from = body.from?.userid || 'unknown';
     if (!content) return;
 
-    console.log(`[WeCom] Received message from ${from} (${content.length} chars)`);
+    console.log(`[WeCom] Received message (${content.length} chars)`);
 
     // /status
     if (/^\/status\b/i.test(content)) {
@@ -3261,6 +3793,7 @@ async function createWecomListener(ctx) {
     }
 
     _runtime.processing = true;
+    _runtime.wecomActiveFrame = frame;
     try {
       const { responseText } = await processUserMessage(content, {
         agentGraph: ctx.agentGraph, graphState: ctx.graphState,
@@ -3282,6 +3815,7 @@ async function createWecomListener(ctx) {
         await wsClient.replyStream(frame, streamId, `❌ Error: ${err.message}`, true);
       } catch { /* best effort */ }
     } finally {
+      _runtime.wecomActiveFrame = null;
       _runtime.processing = false;
     }
   });
@@ -3311,6 +3845,10 @@ async function createWecomListener(ctx) {
     async sendMsg(text) {
       // WeCom doesn't support server-initiated broadcast; skip
       console.log(`[WeCom] (Browser message not forwarded — WeCom does not support server push)`);
+    },
+    async sendImage(imagePath, caption) {
+      if (stopped) return null;
+      return sendWecomPhoto(wsClient, _runtime.wecomActiveFrame, imagePath, caption, generateReqId);
     },
   };
 }
@@ -3409,6 +3947,86 @@ async function switchActiveListener(newChannels, ctx) {
 // messages from the browser are processed AND forwarded to the listener.
 // When no listener is active, responses go through pushoo notifications.
 
+// ─── Scheduler ──────────────────────────────────────────────────────
+//
+// Ticks every 30 seconds, checks _scheduleManager for due tasks, and
+// processes them like user messages — no GitHub Actions involved.
+
+function startScheduler(ctx) {
+  const { repoStore, pushooChannels, agentGraph, graphState, history, loopKey, historyPath } = ctx;
+  const TICK_MS = 30 * 1000; // check every 30 seconds
+
+  const tick = async () => {
+    const now = new Date();
+    const due = _scheduleManager.getDueTasks(now);
+    for (const task of due) {
+      console.log(`[Scheduler] Firing task "${task.name}" (cron: ${task.cron})`);
+      // Mark ran immediately to avoid double-firing if processing takes time
+      _scheduleManager.markRan(task.slug, now);
+
+      // Persist lastRunAt to repo so it survives restarts
+      if (repoStore) {
+        try {
+          const recPath = `loop-agent/schedules/${task.slug}.json`;
+          let record = { ...task };
+          try {
+            const existing = await repoStore.readFile(recPath);
+            if (existing) record = { ...JSON.parse(existing.content), lastRunAt: now.toISOString() };
+          } catch { /* new record */ }
+          record.lastRunAt = now.toISOString();
+          if (!record.executions) record.executions = [];
+          record.executions.push({ timestamp: now.toISOString() });
+          if (record.executions.length > 20) record.executions = record.executions.slice(-20);
+          await repoStore.writeFile(recPath, JSON.stringify(record, null, 2), `[scheduled] Record run for ${task.slug}`);
+        } catch (e) {
+          console.warn(`[Scheduler] Failed to persist record for ${task.slug}: ${e.message}`);
+        }
+      }
+
+      // Build the message delivered to the agent
+      const msgText = [
+        `[Scheduled Task: ${task.name}]`,
+        task.description ? task.description : '',
+        task.prompt,
+      ].filter(Boolean).join('\n');
+
+      try {
+        const { responseText } = await processUserMessage(msgText, {
+          agentGraph, graphState, history, repoStore, loopKey, historyPath,
+        });
+
+        // Send result to all configured notification channels
+        await sendNotifications(pushooChannels, `[Scheduled] ${task.name}`, responseText);
+
+        // Persist execution summary
+        if (repoStore) {
+          try {
+            const recPath = `loop-agent/schedules/${task.slug}.json`;
+            const existing = await repoStore.readFile(recPath);
+            if (existing) {
+              const record = JSON.parse(existing.content);
+              if (record.executions && record.executions.length > 0) {
+                record.executions[record.executions.length - 1].summary = responseText.slice(0, 300);
+                await repoStore.writeFile(recPath, JSON.stringify(record, null, 2), `[scheduled] Save summary for ${task.slug}`);
+              }
+            }
+          } catch { /* non-fatal */ }
+        }
+
+        console.log(`[Scheduler] Task "${task.name}" completed.`);
+      } catch (e) {
+        console.error(`[Scheduler] Task "${task.name}" failed: ${e.message}`);
+        await sendNotifications(pushooChannels, `[Scheduled] ❌ ${task.name} failed`, e.message).catch(() => {});
+      }
+    }
+
+    _runtime.schedulerTimer = setTimeout(tick, TICK_MS);
+  };
+
+  _runtime.schedulerTimer = setTimeout(tick, TICK_MS);
+  console.log(`[Scheduler] Started — ticking every ${TICK_MS / 1000}s, ${_scheduleManager.getAll().length} task(s) loaded`);
+}
+
 function startBrowserPolling(ctx) {
   const { upstash, repoStore, loopKey } = ctx;
   if (!upstash && !repoStore) {
@@ -3503,11 +4121,9 @@ function startBrowserPolling(ctx) {
       const channelJson = text.slice('__SWITCH_CHANNEL__:'.length).trim();
       console.log(`[Control] ────────────────────────────────────────────`);
       console.log(`[Control] SWITCH_CHANNEL received at ${new Date().toISOString()}`);
-      console.log(`[Control] Raw payload: ${channelJson}`);
       console.log(`[Control] Payload length: ${channelJson.length} chars`);
       try {
         const newChannels = JSON.parse(channelJson);
-        console.log(`[Control] Parsed channels: ${JSON.stringify(newChannels)}`);
         console.log(`[Control] Channel count: ${newChannels.length}`);
         console.log(`[Control] Channel platforms: ${newChannels.map(ch => ch.platform).join(', ')}`);
         console.log(`[Control] Channel token lengths: ${newChannels.map(ch => `${ch.platform}=${ch.token ? ch.token.length : 0}`).join(', ')}`);
@@ -3519,7 +4135,6 @@ function startBrowserPolling(ctx) {
           const summary = newChannels.map(ch => ch.platform).join(', ');
           console.log(`[Control] switchActiveListener() returned: ${newType} (took ${switchDuration}ms)`);
           const responseMsg = `📡 **${loopKey}** switched to **${newType}** (channels: ${summary})`;
-          console.log(`[Control] Sending response: ${responseMsg}`);
           await sendResponse(responseMsg);
           await updateStatus('running');
           console.log(`[Control] ✅ SWITCH_CHANNEL complete → ${newType} (${summary})`);
@@ -3885,10 +4500,44 @@ async function main() {
   // ── Start browser polling (always runs) ──
   startBrowserPolling(ctx);
 
+  // ── Load persisted scheduled tasks from repo ──
+  if (repoStore) {
+    try {
+      const resp = await fetch(
+        `${repoStore.api}/repos/${repoStore.owner}/${repoStore.repo}/contents/loop-agent/schedules?ref=main`,
+        { headers: repoStore._headers() }
+      );
+      if (resp.ok) {
+        const files = await resp.json();
+        let loaded = 0;
+        for (const f of files.filter(f => f.name.endsWith('.json'))) {
+          try {
+            const data = await repoStore.readFile(`loop-agent/schedules/${f.name}`);
+            if (data) {
+              const rec = JSON.parse(data.content);
+              if (rec.deleted === true) continue;
+              if (rec.slug && rec.cron && rec.prompt) {
+                _scheduleManager.register(rec);
+                loaded++;
+              }
+            }
+          } catch { /* skip corrupted */ }
+        }
+        console.log(`[Scheduler] Loaded ${loaded} scheduled task(s) from repo.`);
+      }
+    } catch (e) {
+      console.warn(`[Scheduler] Could not load tasks from repo: ${e.message}`);
+    }
+  }
+
+  // ── Start in-process scheduler (replaces GHA cron) ──
+  startScheduler(ctx);
+
   // ── Graceful shutdown ──
   const shutdown = async (signal) => {
     console.log(`[Main] ${signal} received, shutting down...`);
     if (_runtime.pollTimer) clearTimeout(_runtime.pollTimer);
+    if (_runtime.schedulerTimer) clearTimeout(_runtime.schedulerTimer);
     if (_runtime.listener) {
       await _runtime.listener.stop();
       _runtime.listener = null;

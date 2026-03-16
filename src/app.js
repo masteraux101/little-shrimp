@@ -204,9 +204,11 @@ const App = (() => {
     const model = getSessionSetting('model');
     const apiKey = provider === 'qwen' ? getSessionSetting('qwenApiKey')
       : provider === 'kimi' ? getSessionSetting('kimiApiKey')
+      : provider === 'openai' ? getSessionSetting('openaiApiKey')
       : getSessionSetting('apiKey');
     if (!apiKey) missing.push('api_key');
     if (!model) missing.push('model');
+    if (provider === 'openai' && !getSessionSetting('openaiBaseUrl')) missing.push('openai_base_url');
 
     return { ready: missing.length === 0, missing };
   }
@@ -279,11 +281,11 @@ const App = (() => {
   const SESSION_CFG_PREFIX = 'browseragent_session_cfg_';
 
   // Keys that are per-session (each session stores its own independent copy)
-  const SESSION_KEYS = ['apiKey', 'qwenApiKey', 'kimiApiKey', 'provider', 'model', 'enableSearch', 'enableThinking', 'thinkingBudget', 'includeThoughts', 'soulUrl', 'notionToken', 'corsProxy', 'storageBackend', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionUseStorage', 'actionBranch', 'actionWorkflow', 'actionArtifactDir', 'actionToken', 'actionOwner', 'actionRepo', 'pushooConfig', 'upstashUrl', 'upstashToken'];
+  const SESSION_KEYS = ['apiKey', 'qwenApiKey', 'kimiApiKey', 'openaiApiKey', 'openaiBaseUrl', 'provider', 'model', 'enableSearch', 'enableThinking', 'thinkingBudget', 'includeThoughts', 'soulUrl', 'notionToken', 'corsProxy', 'storageBackend', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionUseStorage', 'actionBranch', 'actionWorkflow', 'actionArtifactDir', 'actionToken', 'actionOwner', 'actionRepo', 'pushooConfig', 'upstashUrl', 'upstashToken'];
 
   // Credential-type keys where empty string should be treated as "not set"
   // so the ?? / fallback logic can reach the next level (global settings).
-  const CREDENTIAL_KEYS = new Set(['apiKey', 'qwenApiKey', 'kimiApiKey', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionToken', 'actionOwner', 'actionRepo', 'notionToken', 'pushooConfig', 'upstashUrl', 'upstashToken']);
+  const CREDENTIAL_KEYS = new Set(['apiKey', 'qwenApiKey', 'kimiApiKey', 'openaiApiKey', 'openaiBaseUrl', 'githubToken', 'githubOwner', 'githubRepo', 'githubPath', 'notionStorageToken', 'notionParentPageId', 'actionToken', 'actionOwner', 'actionRepo', 'notionToken', 'pushooConfig', 'upstashUrl', 'upstashToken']);
 
   /**
    * Read a value from a config object with fallback, treating empty strings
@@ -301,6 +303,7 @@ const App = (() => {
     const m = String(model).toLowerCase();
     if (m.startsWith('qwen') || m.startsWith('qwq')) return 'qwen';
     if (m.startsWith('kimi') || m.startsWith('moonshot')) return 'kimi';
+    if (m.startsWith('gpt') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4') || m.startsWith('deepseek') || m.startsWith('claude')) return 'openai';
     return 'gemini';
   }
 
@@ -1213,6 +1216,10 @@ const App = (() => {
         <h2>${tl('landingTitle')}</h2>
         <p>${tl('landingDesc')}</p>
         <div class="landing-features">
+          <div class="landing-feature landing-feature-highlight">
+            <strong>${tl('featureLoopTitle')}</strong>
+            <span>${tl('featureLoopDesc')}</span>
+          </div>
           <div class="landing-feature">
             <strong>${tl('featureSecureTitle')}</strong>
             <span>${tl('featureSecureDesc')}</span>
@@ -1252,6 +1259,7 @@ const App = (() => {
         </div>
         <div class="welcome-hints">
           <p>${tl('welcomeHintsStart')}</p>
+          <code>/loop</code> Deploy Loop Agent &nbsp;
           <code>/clear</code> ${tl('slashClearShort')} &nbsp;
           <code>/compact</code> ${tl('slashCompactShort')} &nbsp;
           <code>/soul</code> ${tl('slashSoulShort')} &nbsp;
@@ -2620,19 +2628,34 @@ const App = (() => {
       // Check prerequisites and guide user if missing
       const prereqs = checkLoopPrerequisites();
       if (!prereqs.ready) {
-        const steps = [];
-        let stepNum = 1;
+        const bubble = addMessageBubble('model', '');
+        const items = [];
         if (prereqs.missing.includes('github_actions')) {
-          steps.push(`**${stepNum++}. Configure GitHub Actions Repository**\nOpen **Settings** (⚙) → **GitHub Actions Execution** and enter your GitHub token, repo owner, and repo name. Or use **Encrypted Session Storage** → GitHub and enable "Use session storage repository".`);
+          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">📂</span><span><strong>Configure GitHub Repository</strong><br><span style="opacity:.7;font-size:12px;">Set up GitHub token &amp; repo for Actions execution</span></span></button>`);
         }
-        if (prereqs.missing.includes('api_key') || prereqs.missing.includes('model')) {
-          steps.push(`**${stepNum++}. Configure AI Model**\nOpen **Settings** (⚙) → **AI Configuration** and select a provider, model, and enter the API key.`);
+        if (prereqs.missing.includes('api_key') || prereqs.missing.includes('model') || prereqs.missing.includes('openai_base_url')) {
+          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">🤖</span><span><strong>Configure AI Model</strong><br><span style="opacity:.7;font-size:12px;">Select provider, model, and enter API key</span></span></button>`);
         }
         if (prereqs.missing.includes('messaging_channel')) {
-          steps.push(`**${stepNum++}. Configure a Messaging Channel**\nLoop Agent requires a bidirectional channel (Telegram or WeCom Bot). Open **Settings** (⚙) → **Notifications** → **Configure Channels** and add a Telegram or WeCom Bot channel.\n\n> For Telegram: create a bot via @BotFather, get the token, then send a message to the bot and use \`botToken#chatId\` format.`);
+          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">📡</span><span><strong>Configure Messaging Channel</strong><br><span style="opacity:.7;font-size:12px;">Add Telegram or WeCom Bot for bidirectional messaging</span></span></button>`);
         }
-        const guideHtml = `## 🔄 Loop Agent Setup Guide\n\nSome prerequisites are missing before you can deploy a Loop Agent. Please complete these steps:\n\n${steps.join('\n\n')}\n\n---\n_After completing the setup, run \`/loop\` again to deploy._`;
-        addMessageBubble('model', guideHtml);
+        bubble.innerHTML = `
+          <div style="padding:12px;">
+            <div style="font-weight:600;font-size:15px;margin-bottom:12px;">🔄 Loop Agent Setup</div>
+            <div style="opacity:.8;margin-bottom:14px;font-size:13px;">Complete the following before deploying:</div>
+            <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">${items.join('')}</div>
+            <button class="loop-prereq-retry" style="width:100%;padding:8px 14px;background:#22863a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">🔄 Retry /loop</button>
+          </div>
+        `;
+        // Wire buttons
+        bubble.querySelectorAll('.loop-prereq-btn').forEach(btn => {
+          btn.addEventListener('click', () => openSettings());
+        });
+        bubble.querySelector('.loop-prereq-retry')?.addEventListener('click', () => {
+          const input = document.getElementById('message-input');
+          if (input) { input.value = '/loop'; }
+          document.getElementById('send-btn')?.click();
+        });
         return true;
       }
 
@@ -2653,7 +2676,9 @@ const App = (() => {
       const model = getSessionSetting('model');
       const apiKey = provider === 'qwen' ? getSessionSetting('qwenApiKey')
         : provider === 'kimi' ? getSessionSetting('kimiApiKey')
+        : provider === 'openai' ? getSessionSetting('openaiApiKey')
         : getSessionSetting('apiKey');
+      const openaiBaseUrl = provider === 'openai' ? getSessionSetting('openaiBaseUrl') : '';
 
       if (!apiKey) {
         addMessageBubble('model', `⚠️ ${tl('toastSetApiKeyFirst')}`);
@@ -2668,48 +2693,48 @@ const App = (() => {
         <div class="schedule-wizard">
           <div class="schedule-wizard-title">🔄 ${tl('msgDeployLoopAgent')}</div>
 
-          <label class="schedule-field-label">${tl('msgLoopKey')}</label>
-          <input id="loop-key-input" class="schedule-input" type="text" value="${escapeHtml(loopKey)}" readonly style="font-family:monospace;background:var(--bg-darker,#111);cursor:text;" />
-          <div class="hint" style="margin-top:2px;">This key identifies the agent. Messages are delivered via ${hasWecom ? 'WeCom Bot' : hasTelegram ? 'Telegram' : 'configured channels'}.</div>
+          <div style="background:rgba(34,134,58,.12);border:1px solid rgba(34,134,58,.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;">
+            <label class="schedule-field-label" style="margin-bottom:4px;">🔐 Encryption Key</label>
+            <input id="loop-encrypt-key" class="schedule-input" type="password" placeholder="Enter a passphrase to encrypt repo files…" autocomplete="off" style="font-size:14px;padding:10px 12px;border:2px solid rgba(34,134,58,.5);" />
+            <div class="hint" style="margin-top:4px;color:rgba(255,255,255,.5);">AES-256-GCM encrypted. You'll need this key later.</div>
+          </div>
 
           <label class="schedule-field-label">${tl('msgLoopSystemPrompt')}</label>
-          <textarea id="loop-system-prompt" class="schedule-input" rows="3" placeholder="Optional: custom system prompt for the agent..."
+          <textarea id="loop-system-prompt" class="schedule-input" rows="2" placeholder="Optional: custom system prompt..."
             style="resize:vertical;font-size:12px;"></textarea>
 
-          <label class="schedule-field-label">${tl('msgLoopPollInterval')}</label>
-          <select id="loop-poll-interval" class="schedule-input">
-            <option value="3">3 seconds</option>
-            <option value="5" selected>5 seconds</option>
-            <option value="10">10 seconds</option>
-            <option value="30">30 seconds</option>
-          </select>
-
-          <label class="schedule-field-label">${tl('msgLoopMaxRuntime')}</label>
-          <select id="loop-max-runtime" class="schedule-input">
-            <option value="3600">1 hour</option>
-            <option value="10800">3 hours</option>
-            <option value="18000" selected>5 hours (default)</option>
-            <option value="21000">5h50m (near Actions limit)</option>
-          </select>
-
-          <label class="schedule-field-label">🔐 Encryption Key (recommended)</label>
-          <input id="loop-encrypt-key" class="schedule-input" type="password" placeholder="Enter a passphrase to encrypt repo files…" autocomplete="off" />
-          <div class="hint" style="margin-top:2px;">Files stored in the repo will be AES-256-GCM encrypted. You will need this key to view history later.</div>
-
-          <div class="schedule-notify-row" style="margin-top:10px;">
-            <div class="schedule-checkbox-label">
-              📢 <span class="schedule-hint" style="color:#22863a">✅ ${tl('msgAutoNotifyVia')} ${PushooNotifier.getChannelSummary(pushooConfig)}</span>
+          <div style="display:flex;gap:8px;">
+            <div style="flex:1;">
+              <label class="schedule-field-label">${tl('msgLoopMaxRuntime')}</label>
+              <select id="loop-max-runtime" class="schedule-input">
+                <option value="3600">1 hour</option>
+                <option value="10800">3 hours</option>
+                <option value="18000" selected>5 hours</option>
+                <option value="21000">5h50m</option>
+              </select>
+            </div>
+            <div style="flex:1;">
+              <label class="schedule-field-label">${tl('msgLoopPollInterval')}</label>
+              <select id="loop-poll-interval" class="schedule-input">
+                <option value="3">3s</option>
+                <option value="5" selected>5s</option>
+                <option value="10">10s</option>
+                <option value="30">30s</option>
+              </select>
             </div>
           </div>
 
-          <div class="schedule-preview" id="loop-preview">
-            <div class="schedule-preview-title">${tl('msgPreview')}</div>
-            <div class="schedule-preview-body">
-              <div>🔑 Key: <code>${escapeHtml(loopKey)}</code></div>
-              <div>🤖 Model: <code>${escapeHtml(provider)}/${escapeHtml(model)}</code></div>
-              <div>📂 Repo: <code>${escapeHtml(config.owner)}/${escapeHtml(config.repo)}</code></div>
-            </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin:10px 0;font-size:12px;opacity:.8;">
+            <span>🔑 <code>${escapeHtml(loopKey)}</code></span>
+            <span>·</span>
+            <span>🤖 ${escapeHtml(provider)}/${escapeHtml(model)}</span>
+            <span>·</span>
+            <span>📂 ${escapeHtml(config.owner)}/${escapeHtml(config.repo)}</span>
+            <span>·</span>
+            <span>📢 ${PushooNotifier.getChannelSummary(pushooConfig)}</span>
           </div>
+
+          <input id="loop-key-input" type="hidden" value="${escapeHtml(loopKey)}" />
 
           <div class="schedule-actions">
             <button id="loop-cancel-btn" class="schedule-btn schedule-btn-secondary">${tl('cancel')}</button>
@@ -2766,6 +2791,7 @@ const App = (() => {
             },
             secrets: {
               aiApiKey: apiKey,
+              aiBaseUrl: openaiBaseUrl || undefined,
               upstashUrl: getSessionSetting('upstashUrl') || undefined,
               upstashToken: getSessionSetting('upstashToken') || undefined,
               pushooChannels: freshPushoo.channels.length > 0 ? JSON.stringify(freshPushoo.channels) : undefined,
@@ -2793,36 +2819,38 @@ const App = (() => {
           }
           bubble.innerHTML = `
             <div style="padding:12px;">
-              <div style="font-weight:600;font-size:15px;margin-bottom:12px;">✅ Loop Agent Deployed!</div>
-
-              <div style="margin-bottom:16px;">
-                <div style="font-weight:500;margin-bottom:4px;">🔑 Your Loop Key:</div>
-                <code style="display:block;padding:8px 12px;background:var(--bg-darker,#111);border-radius:4px;font-size:14px;letter-spacing:0.5px;user-select:all;">${escapeHtml(loopKey)}</code>
-                <div class="hint" style="margin-top:4px;">This key identifies the agent instance.</div>
-              </div>
+              <div style="font-weight:600;font-size:15px;margin-bottom:10px;">✅ Loop Agent Deployed!</div>
 
               <div style="margin-bottom:12px;">
-                <div>🤖 ${escapeHtml(provider)}/${escapeHtml(model)}</div>
-                <div>📂 <a href="${repoUrl}" target="_blank">${escapeHtml(config.owner)}/${escapeHtml(config.repo)}</a></div>
-                <div>⏱ Max runtime: ${maxRuntime / 3600}h · Poll: ${pollInterval}s</div>
-                ${result.synced.length ? `<div>🔑 Secrets synced: ${result.synced.join(', ')}</div>` : ''}
-                ${result.errors.length ? `<div style="color:#e74c3c;">❌ Errors: ${result.errors.join('; ')}</div>` : ''}
+                <code style="display:block;padding:8px 12px;background:var(--bg-darker,#111);border-radius:4px;font-size:14px;letter-spacing:0.5px;user-select:all;">${escapeHtml(loopKey)}</code>
               </div>
 
-              <div style="font-size:13px;opacity:.8;margin-bottom:12px;">
-                <strong>How to interact:</strong><br>
-                • <code>/loop connect ${escapeHtml(loopKey)}</code> to chat with the agent directly from here<br>
-                • Send messages via ${hasWecom ? 'WeCom Bot' : PushooNotifier.getChannelSummary(freshPushoo)} — the agent will reply there<br>
-                • <code>/loop status</code> to check agent status
+              <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;font-size:12px;opacity:.7;">
+                <span>🤖 ${escapeHtml(provider)}/${escapeHtml(model)}</span>
+                <span>·</span>
+                <span>📂 <a href="${repoUrl}" target="_blank" style="color:#8ec5fc;">${escapeHtml(config.owner)}/${escapeHtml(config.repo)}</a></span>
+                <span>·</span>
+                <span>⏱ ${maxRuntime / 3600}h</span>
+                ${result.errors.length ? `<span style="color:#e74c3c;">· ❌ ${result.errors.join('; ')}</span>` : ''}
               </div>
 
-              <div style="display:flex;gap:8px;">
-                <a href="${repoUrl}/actions" target="_blank" class="btn-primary" style="padding:6px 14px;border-radius:4px;text-decoration:none;font-size:12px;text-align:center;">
-                  📊 View Actions
-                </a>
+              <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                <button class="loop-success-cmd" data-cmd="/loop connect ${escapeHtml(loopKey)}" style="display:flex;align-items:center;gap:4px;padding:6px 14px;background:#22863a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">🔗 Connect</button>
+                <button class="loop-success-cmd" data-cmd="/loop status" style="display:flex;align-items:center;gap:4px;padding:6px 14px;background:rgba(255,255,255,.1);color:#e0e0e0;border:1px solid rgba(255,255,255,.15);border-radius:6px;cursor:pointer;font-size:12px;">📊 Status</button>
+                <button class="loop-success-cmd" data-cmd="/loop dashboard" style="display:flex;align-items:center;gap:4px;padding:6px 14px;background:rgba(255,255,255,.1);color:#e0e0e0;border:1px solid rgba(255,255,255,.15);border-radius:6px;cursor:pointer;font-size:12px;">📋 Dashboard</button>
+                <a href="${repoUrl}/actions" target="_blank" style="display:flex;align-items:center;gap:4px;padding:6px 14px;background:rgba(255,255,255,.1);color:#e0e0e0;border:1px solid rgba(255,255,255,.15);border-radius:6px;cursor:pointer;font-size:12px;text-decoration:none;">🔗 GitHub Actions</a>
               </div>
             </div>
           `;
+
+          // Wire command buttons
+          bubble.querySelectorAll('.loop-success-cmd').forEach(btn => {
+            btn.addEventListener('click', () => {
+              const input = document.getElementById('message-input');
+              if (input) { input.value = btn.dataset.cmd; }
+              document.getElementById('send-btn')?.click();
+            });
+          });
 
           showToast(`Loop agent "${loopKey}" deployed and started!`, 'success');
 
@@ -2904,6 +2932,7 @@ const App = (() => {
     // Get the appropriate API key for the provider
     let apiKey;
     let qwenApiKey = null;
+    let openaiBaseUrl = null;
     if (provider === 'qwen') {
       apiKey = getSessionSetting('qwenApiKey');
       if (!apiKey) {
@@ -2915,6 +2944,19 @@ const App = (() => {
       apiKey = getSessionSetting('kimiApiKey');
       if (!apiKey) {
         showToast(tl('toastPleaseSetKimiKey'), 'error');
+        openSettings();
+        return;
+      }
+    } else if (provider === 'openai') {
+      apiKey = getSessionSetting('openaiApiKey');
+      openaiBaseUrl = getSessionSetting('openaiBaseUrl');
+      if (!apiKey) {
+        showToast('Please set your OpenAI-compatible API key in settings', 'error');
+        openSettings();
+        return;
+      }
+      if (!openaiBaseUrl) {
+        showToast('Please set the Base URL for your OpenAI-compatible endpoint', 'error');
         openSettings();
         return;
       }
@@ -2998,6 +3040,7 @@ const App = (() => {
         provider,
         apiKey,
         qwenApiKey: getSessionSetting('qwenApiKey'),
+        openaiBaseUrl,
         model,
         message: text,
         enableSearch,
@@ -3130,6 +3173,8 @@ const App = (() => {
     $('#set-api-key').value = get('apiKey', '');
     $('#set-qwen-api-key').value = get('qwenApiKey', '');
     $('#set-kimi-api-key').value = get('kimiApiKey', '');
+    $('#set-openai-api-key').value = get('openaiApiKey', '');
+    $('#set-openai-base-url').value = get('openaiBaseUrl', '');
     $('#set-github-token').value = get('githubToken', '');
     $('#set-github-owner').value = get('githubOwner', '');
     $('#set-github-repo').value = get('githubRepo', '');
@@ -3216,6 +3261,8 @@ const App = (() => {
       apiKey:             $('#set-api-key').value.trim(),
       qwenApiKey:         $('#set-qwen-api-key').value.trim(),
       kimiApiKey:         $('#set-kimi-api-key').value.trim(),
+      openaiApiKey:       $('#set-openai-api-key').value.trim(),
+      openaiBaseUrl:      $('#set-openai-base-url').value.trim(),
       githubToken:        $('#set-github-token').value.trim(),
       githubOwner:        $('#set-github-owner').value.trim(),
       githubRepo:         $('#set-github-repo').value.trim(),
@@ -3479,6 +3526,7 @@ const App = (() => {
     const geminiFields = $('#gemini-fields');
     const qwenFields = $('#qwen-fields');
     const kimiFields = $('#kimi-fields');
+    const openaiFields = $('#openai-fields');
     const modelInput = $('#set-model');
     const currentModel = (modelInput?.value || '').trim().toLowerCase();
     const hasModel = !!currentModel;
@@ -3494,6 +3542,7 @@ const App = (() => {
       show(qwenFields);
       hide(geminiFields);
       hide(kimiFields);
+      hide(openaiFields);
       if (modelInput && shouldUseProviderDefault) {
         modelInput.value = 'qwen3-max-2026-01-23';
       }
@@ -3501,13 +3550,24 @@ const App = (() => {
       show(kimiFields);
       hide(geminiFields);
       hide(qwenFields);
+      hide(openaiFields);
       if (modelInput && shouldUseProviderDefault) {
         modelInput.value = 'kimi-k2-turbo-preview';
+      }
+    } else if (provider === 'openai') {
+      show(openaiFields);
+      hide(geminiFields);
+      hide(qwenFields);
+      hide(kimiFields);
+      if (modelInput && shouldUseProviderDefault) {
+        modelInput.value = '';
+        modelInput.placeholder = 'e.g., gpt-4o, deepseek-chat, claude-3.5-sonnet';
       }
     } else {
       show(geminiFields);
       hide(qwenFields);
       hide(kimiFields);
+      hide(openaiFields);
       if (modelInput && shouldUseProviderDefault) {
         modelInput.value = 'gemini-2.5-flash';
       }
@@ -4774,7 +4834,12 @@ const App = (() => {
             <option value="gemini">Google Gemini</option>
             <option value="qwen">Qwen (DashScope)</option>
             <option value="kimi">Kimi (Moonshot)</option>
+            <option value="openai">OpenAI Compatible</option>
           </select>
+        </div>
+        <div class="setup-field" id="setup-baseurl-field" style="display:none;">
+          <label>Base URL</label>
+          <input type="text" id="setup-base-url" class="setup-input" placeholder="https://api.openai.com/v1" />
         </div>
         <div class="setup-field">
           <label>${tl('setupModel')}</label>
@@ -4812,8 +4877,12 @@ const App = (() => {
     const globalProvider = savedSettings.provider || 'gemini';
     providerSel.value = globalProvider;
 
+    const baseUrlField = sysMsg.querySelector('#setup-baseurl-field');
+    const baseUrlInput = sysMsg.querySelector('#setup-base-url');
+
     function updateProviderUI() {
       const p = providerSel.value;
+      baseUrlField.style.display = p === 'openai' ? '' : 'none';
       if (p === 'qwen') {
         keyLabel.textContent = tl('setupApiKeyQwen');
         keyInput.placeholder = 'sk-...';
@@ -4824,6 +4893,12 @@ const App = (() => {
         keyInput.placeholder = 'sk-...';
         if (!modelInput.value || !modelInput.value.startsWith('kimi')) modelInput.value = 'kimi-k2-turbo-preview';
         keyInput.value = savedSettings.kimiApiKey || '';
+      } else if (p === 'openai') {
+        keyLabel.textContent = 'API Key';
+        keyInput.placeholder = 'sk-...';
+        modelInput.value = modelInput.value || 'gpt-4o';
+        keyInput.value = savedSettings.openaiApiKey || '';
+        baseUrlInput.value = savedSettings.openaiBaseUrl || '';
       } else {
         keyLabel.textContent = tl('setupApiKeyGemini');
         keyInput.placeholder = 'AIza...';
@@ -4855,6 +4930,11 @@ const App = (() => {
         modelInput.focus();
         return;
       }
+      if (provider === 'openai' && !baseUrlInput.value.trim()) {
+        showToast('Please enter a Base URL', 'error');
+        baseUrlInput.focus();
+        return;
+      }
 
       // Save to session config
       const cfg = getSessionConfig(_setupSessionId);
@@ -4863,6 +4943,7 @@ const App = (() => {
       cfg.enableSearch = enableSearch;
       if (provider === 'qwen') cfg.qwenApiKey = apiKey;
       else if (provider === 'kimi') cfg.kimiApiKey = apiKey;
+      else if (provider === 'openai') { cfg.openaiApiKey = apiKey; cfg.openaiBaseUrl = baseUrlInput.value.trim(); }
       else cfg.apiKey = apiKey;
       saveSessionConfig(_setupSessionId, cfg);
 
@@ -4871,6 +4952,7 @@ const App = (() => {
       setSetting('model', model);
       if (provider === 'qwen') setSetting('qwenApiKey', apiKey);
       else if (provider === 'kimi') setSetting('kimiApiKey', apiKey);
+      else if (provider === 'openai') { setSetting('openaiApiKey', apiKey); setSetting('openaiBaseUrl', baseUrlInput.value.trim()); }
       else setSetting('apiKey', apiKey);
 
       // Disable step 1

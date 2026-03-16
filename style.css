@@ -824,6 +824,16 @@ html, body {
   line-height: 1.4;
 }
 
+.landing-feature-highlight {
+  grid-column: 1 / -1;
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-surface));
+}
+
+.landing-feature-highlight strong {
+  color: var(--accent);
+}
+
 .landing-cta {
   margin-top: 20px;
   color: var(--text-secondary);
@@ -947,6 +957,17 @@ html, body {
   background: var(--accent);
   color: white;
   border-color: var(--accent);
+}
+
+.quick-action-primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.quick-action-primary:hover {
+  filter: brightness(1.1);
 }
 
 /* ─── Settings Panel ─────────────────────────────────────────────────── */

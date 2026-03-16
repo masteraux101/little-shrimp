@@ -45,10 +45,10 @@
 
     <!-- Input Area -->
     <div class="quick-actions" id="quick-actions">
+      <button class="quick-action-btn quick-action-primary" id="quick-btn-loop" data-cmd="/loop" title="Loop Agent">🔄 Loop</button>
       <button class="quick-action-btn" id="quick-btn-skills" data-cmd="/skills" title="Manage skills">🧩 Skills</button>
       <button class="quick-action-btn" id="quick-btn-souls" data-cmd="/soul list" title="Browse SOULs">🧠 Souls</button>
       <button class="quick-action-btn" id="quick-btn-compact" data-cmd="/compact" title="Compress context">📦 Compact</button>
-      <button class="quick-action-btn" id="quick-btn-loop" data-cmd="/loop" title="Loop Agent">🔄 Loop</button>
     </div>
     <div id="loop-connect-banner" class="hidden" style="display:none;align-items:center;justify-content:space-between;padding:6px 14px;background:linear-gradient(90deg,#1a3a2a,#0d1f17);border:1px solid #22863a;border-radius:8px;font-size:13px;color:#4ae168;margin:0 24px 4px;">
       <span>🔄 Connected to Loop Agent: <strong id="loop-connect-key"></strong></span>
@@ -111,6 +111,7 @@
             <option value="gemini">Google Gemini</option>
             <option value="qwen">Qwen (via DashScope)</option>
             <option value="kimi">Kimi (via Moonshot)</option>
+            <option value="openai">OpenAI Compatible</option>
           </select>
           <div class="hint">Choose your preferred AI model provider</div>
         </div>
@@ -153,6 +154,22 @@
             <button type="button" class="password-toggle" data-for="set-kimi-api-key" title="Show/hide">👁</button>
           </div>
           <div class="hint">Moonshot API key for Kimi models (from https://platform.moonshot.cn)</div>
+        </div>
+      </div>
+
+      <div id="openai-fields" class="hidden">
+        <div class="settings-field">
+          <label for="set-openai-base-url">Base URL</label>
+          <input type="url" id="set-openai-base-url" placeholder="https://api.openai.com/v1" autocomplete="off" />
+          <div class="hint">OpenAI-compatible API base URL (e.g. https://api.openai.com/v1, https://api.deepseek.com/v1)</div>
+        </div>
+        <div class="settings-field">
+          <label for="set-openai-api-key">API Key</label>
+          <div class="password-input-group">
+            <input type="password" id="set-openai-api-key" placeholder="sk-..." autocomplete="off" />
+            <button type="button" class="password-toggle" data-for="set-openai-api-key" title="Show/hide">👁</button>
+          </div>
+          <div class="hint">API key for the OpenAI-compatible endpoint</div>
         </div>
       </div>
 

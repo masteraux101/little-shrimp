@@ -603,12 +603,130 @@ const ProviderAPI = (() => {
     return { GEMINI_MODELS, generateContent, testApiKey };
   })();
 
+  // ─── OpenAI-compatible via BaseUrl + API Key ──────────────────────
+
+  const OpenAICompat = (() => {
+    async function generateContent(config) {
+      const {
+        apiKey,
+        baseUrl,
+        model,
+        systemInstruction = '',
+        messages = [],
+        onChunk = null,
+        abortSignal = null,
+        enableSearch = false,
+        thinkingConfig = null,
+      } = config;
+
+      if (!apiKey) throw new Error('API Key is required');
+      if (!baseUrl) throw new Error('Base URL is required');
+      if (!model) throw new Error('Model is required');
+      if (!messages.length) throw new Error('At least one message is required');
+
+      const chatMessages = [];
+      if (systemInstruction) {
+        chatMessages.push({ role: 'system', content: systemInstruction });
+      }
+      for (const msg of messages) {
+        chatMessages.push({
+          role: msg.role === 'assistant' ? 'assistant' : 'user',
+          content: msg.content || msg.parts?.map(p => p.text).join('') || '',
+        });
+      }
+
+      const url = baseUrl.replace(/\/+$/, '') + '/chat/completions';
+
+      let fullText = '';
+      let usageInfo = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+      const requestBody = {
+        model,
+        messages: chatMessages,
+        stream: true,
+        temperature: 1.0,
+        top_p: 0.95,
+        max_tokens: 8192,
+      };
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(requestBody),
+        signal: abortSignal,
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`API error: ${response.status} - ${error}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pendingBuffer = '';
+
+      function processSseLine(line) {
+        if (!line.trim() || line.startsWith(':')) return;
+        if (!line.startsWith('data: ')) return;
+        const data = line.slice(6);
+        if (data === '[DONE]') return;
+        try {
+          const chunk = JSON.parse(data);
+          if (chunk.choices?.[0]?.delta?.content) {
+            const chunkText = chunk.choices[0].delta.content;
+            fullText += chunkText;
+            if (onChunk) onChunk({ type: 'text', text: chunkText });
+          }
+          if (chunk.usage) {
+            usageInfo = {
+              promptTokens: chunk.usage.prompt_tokens || 0,
+              completionTokens: chunk.usage.completion_tokens || 0,
+              totalTokens: chunk.usage.total_tokens || 0,
+            };
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          pendingBuffer += decoder.decode(value, { stream: true });
+          const lines = pendingBuffer.split('\n');
+          pendingBuffer = lines.pop() || '';
+          for (const line of lines) processSseLine(line);
+        }
+        if (pendingBuffer.trim()) processSseLine(pendingBuffer);
+      } finally {
+        reader.releaseLock();
+      }
+
+      return { text: fullText, usageInfo };
+    }
+
+    async function testApiKey(apiKey, baseUrl, model) {
+      try {
+        const result = await generateContent({
+          apiKey, baseUrl, model,
+          messages: [{ role: 'user', content: 'Hi' }],
+        });
+        return result && result.text && result.text.length > 0;
+      } catch { return false; }
+    }
+
+    return { generateContent, testApiKey };
+  })();
+
   // ─── Public API ────────────────────────────────────────────────────
 
   return {
     Gemini,
     Qwen,
     Kimi,
+    OpenAICompat,
   };
 })();
 

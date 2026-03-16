@@ -101,6 +101,7 @@ const LoopAgent = (() => {
       `          AI_PROVIDER: "${provider}"`,
       `          AI_MODEL: "${model}"`,
       '          AI_API_KEY: ${{ secrets.AI_API_KEY }}',
+      '          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}',
       '          PUSHOO_CHANNELS: ${{ secrets.PUSHOO_CHANNELS }}',
       '          GH_PAT: ${{ secrets.GH_PAT }}',
       '          GITHUB_REPOSITORY: ${{ github.repository }}',
@@ -179,6 +180,7 @@ const LoopAgent = (() => {
     if (secrets.upstashUrl)     secretMap.push({ name: 'UPSTASH_URL',     value: secrets.upstashUrl });
     if (secrets.upstashToken)   secretMap.push({ name: 'UPSTASH_TOKEN',   value: secrets.upstashToken });
     if (secrets.aiApiKey)       secretMap.push({ name: 'AI_API_KEY',      value: secrets.aiApiKey });
+    if (secrets.aiBaseUrl)      secretMap.push({ name: 'AI_BASE_URL',     value: secrets.aiBaseUrl });
     if (secrets.pushooChannels) secretMap.push({ name: 'PUSHOO_CHANNELS', value: secrets.pushooChannels });
     // Use the user's PAT (not the default GITHUB_TOKEN) for repo operations
     if (actionConfig.token)     secretMap.push({ name: 'GH_PAT',          value: actionConfig.token });
