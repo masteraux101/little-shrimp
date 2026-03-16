@@ -830,6 +830,11 @@ html, body {
   background: color-mix(in srgb, var(--accent) 8%, var(--bg-surface));
 }
 
+/* Make the last regular card span full width when it would be alone in its row */
+.landing-feature:not(.landing-feature-highlight):last-child:nth-child(even) {
+  grid-column: 1 / -1;
+}
+
 .landing-feature-highlight strong {
   color: var(--accent);
 }
@@ -936,7 +941,7 @@ html, body {
 .quick-actions {
   display: flex;
   gap: 6px;
-  padding: 6px 24px 0;
+  padding: 6px 24px 4px;
   background: var(--bg-secondary);
   flex-wrap: wrap;
 }
@@ -1706,7 +1711,7 @@ html, body {
 /* ─── Grounding Sources ──────────────────────────────────────────────── */
 
 .grounding-sources {
-  margin: 4px 56px 12px;
+  margin: 4px 0 12px;
   padding: 10px 14px;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
@@ -2382,7 +2387,7 @@ html, body {
   font-size: 13px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: var(--bg);
+  background: var(--bg-primary);
   color: var(--text-primary);
   font-family: var(--font-mono);
   box-sizing: border-box;
@@ -2427,7 +2432,7 @@ html, body {
 .schedule-preview {
   margin-top: 16px;
   padding: 12px;
-  background: var(--bg);
+  background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: 8px;
 }
@@ -2492,7 +2497,7 @@ html, body {
 }
 
 .schedule-btn-secondary {
-  background: var(--bg);
+  background: var(--bg-primary);
   color: var(--text-secondary);
   border: 1px solid var(--border);
 }
@@ -2500,4 +2505,85 @@ html, body {
 .schedule-btn-secondary:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+/* ─── Loop Connect Banner ─────────────────────────────────────────────── */
+
+#loop-connect-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  background: linear-gradient(90deg, #1a3a2a, #0d1f17);
+  border: 1px solid #22863a;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: #4ae168;
+  margin: 0 24px 4px;
+}
+
+#loop-disconnect-btn {
+  background: none;
+  border: 1px solid #4ae168;
+  color: #4ae168;
+  border-radius: var(--radius-xs);
+  padding: 2px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background var(--transition);
+}
+
+#loop-disconnect-btn:hover {
+  background: rgba(74, 225, 104, 0.15);
+}
+
+/* ─── Loop Status Panel ───────────────────────────────────────────────── */
+
+#loop-status-panel {
+  padding: 8px 14px;
+  background: linear-gradient(90deg, #1a2a3a, #0d1720);
+  border: 1px solid #2d6a9f;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: #8ec5fc;
+  margin: 0 24px 4px;
+}
+
+.loop-status-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.loop-status-title {
+  font-weight: 600;
+}
+
+.loop-status-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+#loop-panel-refresh,
+#loop-panel-close {
+  background: none;
+  border: 1px solid #8ec5fc;
+  color: #8ec5fc;
+  border-radius: var(--radius-xs);
+  padding: 1px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  transition: background var(--transition);
+}
+
+#loop-panel-refresh:hover,
+#loop-panel-close:hover {
+  background: rgba(142, 197, 252, 0.15);
+}
+
+#loop-status-content {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
 }

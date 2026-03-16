@@ -50,19 +50,19 @@
       <button class="quick-action-btn" id="quick-btn-souls" data-cmd="/soul list" title="Browse SOULs">🧠 Souls</button>
       <button class="quick-action-btn" id="quick-btn-compact" data-cmd="/compact" title="Compress context">📦 Compact</button>
     </div>
-    <div id="loop-connect-banner" class="hidden" style="display:none;align-items:center;justify-content:space-between;padding:6px 14px;background:linear-gradient(90deg,#1a3a2a,#0d1f17);border:1px solid #22863a;border-radius:8px;font-size:13px;color:#4ae168;margin:0 24px 4px;">
+    <div id="loop-connect-banner" class="hidden">
       <span>🔄 Connected to Loop Agent: <strong id="loop-connect-key"></strong></span>
-      <button id="loop-disconnect-btn" style="background:none;border:1px solid #4ae168;color:#4ae168;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:12px;" title="Disconnect from loop agent">✕ Disconnect</button>
+      <button id="loop-disconnect-btn" title="Disconnect from loop agent">✕ Disconnect</button>
     </div>
-    <div id="loop-status-panel" class="hidden" style="display:none;padding:8px 14px;background:linear-gradient(90deg,#1a2a3a,#0d1720);border:1px solid #2d6a9f;border-radius:8px;font-size:12px;color:#8ec5fc;margin:0 24px 4px;">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
-        <span style="font-weight:600;">🔄 Loop Agent Dashboard</span>
-        <div style="display:flex;gap:6px;">
-          <button id="loop-panel-refresh" style="background:none;border:1px solid #8ec5fc;color:#8ec5fc;border-radius:4px;padding:1px 8px;cursor:pointer;font-size:11px;" title="Refresh status">↻</button>
-          <button id="loop-panel-close" style="background:none;border:1px solid #8ec5fc;color:#8ec5fc;border-radius:4px;padding:1px 8px;cursor:pointer;font-size:11px;" title="Close panel">✕</button>
+    <div id="loop-status-panel" class="hidden">
+      <div class="loop-status-header">
+        <span class="loop-status-title">🔄 Loop Agent Dashboard</span>
+        <div class="loop-status-buttons">
+          <button id="loop-panel-refresh" title="Refresh status">↻</button>
+          <button id="loop-panel-close" title="Close panel">✕</button>
         </div>
       </div>
-      <div id="loop-status-content" style="display:flex;flex-wrap:wrap;gap:8px 16px;"></div>
+      <div id="loop-status-content"></div>
     </div>
     <div class="input-area">
       <div id="slash-autocomplete" class="hidden"></div>
@@ -449,7 +449,7 @@
         <button class="modal-close" id="pushoo-config-close">&times;</button>
       </div>
       <div class="modal-body">
-        <p style="margin:0 0 12px;color:#777;font-size:13px">Configure one or more notification channels. Telegram and WeCom Bot use native SDKs for bidirectional messaging.
+        <p style="margin:0 0 12px;font-size:13px">Configure one or more notification channels. Telegram and WeCom Bot use native SDKs for bidirectional messaging.
           <a href="https://pushoo.js.org/" target="_blank">Pushoo docs →</a></p>
 
         <div id="pushoo-channels-list" style="display:flex;flex-direction:column;gap:12px;">
