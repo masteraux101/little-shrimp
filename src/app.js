@@ -33,6 +33,7 @@ const App = (() => {
   let _loopConnectedKey = null;   // Currently connected loop agent key (null = not connected)
   let _loopPollTimer = null;      // Timeout for polling loop agent responses
   let _loopPollReset = null;      // Function to reset adaptive polling to fast mode
+  let openPushooConfigDialog = null;
 
   function getLoopDataRepoForKey(loopKey) {
     if (!currentSessionId || !loopKey) return null;
@@ -541,16 +542,10 @@ const App = (() => {
       quickSouls.title = tl('quickSouls');
     }
 
-    const quickCompact = $('#quick-btn-compact');
-    if (quickCompact) {
-      quickCompact.innerHTML = `📦 ${tl('quickCompact')}`;
-      quickCompact.title = tl('quickCompact');
-    }
-
     const quickLoop = $('#quick-btn-loop');
     if (quickLoop) {
-      quickLoop.innerHTML = `🔄 ${tl('quickLoop')}`;
-      quickLoop.title = tl('quickLoop');
+      quickLoop.innerHTML = `🔄 ${tl('quickLoopBrief')}`;
+      quickLoop.title = tl('quickLoopBrief');
     }
 
     // Update page title
@@ -986,7 +981,7 @@ const App = (() => {
     const backend = entry?.backend || loadGet('storageBackend', 'local');
 
     // Always prompt passphrase via dialog for loading
-    const pass = await promptPassphrase('Enter the passphrase to decrypt this session:');
+    const pass = await promptPassphrase(tl('decryptDesc'));
     if (!pass) return; // user cancelled
 
     // Clean up incomplete setup if switching away
@@ -2701,25 +2696,34 @@ const App = (() => {
         const bubble = addMessageBubble('model', '');
         const items = [];
         if (prereqs.missing.includes('github_actions')) {
-          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">📂</span><span><strong>Configure GitHub Repository</strong><br><span style="opacity:.7;font-size:12px;">Set up GitHub token &amp; repo for Actions execution</span></span></button>`);
+          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">📂</span><span><strong>${escapeHtml(tl('loopPrereqGithubTitle'))}</strong><br><span style="opacity:.7;font-size:12px;">${escapeHtml(tl('loopPrereqGithubDesc'))}</span></span></button>`);
         }
         if (prereqs.missing.includes('api_key') || prereqs.missing.includes('model') || prereqs.missing.includes('openai_base_url')) {
-          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">🤖</span><span><strong>Configure AI Model</strong><br><span style="opacity:.7;font-size:12px;">Select provider, model, and enter API key</span></span></button>`);
+          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">🤖</span><span><strong>${escapeHtml(tl('loopPrereqAiTitle'))}</strong><br><span style="opacity:.7;font-size:12px;">${escapeHtml(tl('loopPrereqAiDesc'))}</span></span></button>`);
         }
         if (prereqs.missing.includes('messaging_channel')) {
-          items.push(`<button class="loop-prereq-btn" data-action="settings" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">📡</span><span><strong>Configure Messaging Channel</strong><br><span style="opacity:.7;font-size:12px;">Add Telegram or WeCom Bot for bidirectional messaging</span></span></button>`);
+          items.push(`<button class="loop-prereq-btn" data-action="pushoo" style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;color:#e0e0e0;font-size:13px;text-align:left;"><span style="font-size:18px;">📡</span><span><strong>${escapeHtml(tl('loopPrereqChannelTitle'))}</strong><br><span style="opacity:.7;font-size:12px;">${escapeHtml(tl('loopPrereqChannelDesc'))}</span></span></button>`);
         }
         bubble.innerHTML = `
           <div style="padding:12px;">
-            <div style="font-weight:600;font-size:15px;margin-bottom:12px;">🔄 Loop Agent Setup</div>
-            <div style="opacity:.8;margin-bottom:14px;font-size:13px;">Complete the following before deploying:</div>
+            <div style="font-weight:600;font-size:15px;margin-bottom:12px;">🔄 ${escapeHtml(tl('loopSetupTitle'))}</div>
+            <div style="opacity:.8;margin-bottom:14px;font-size:13px;">${escapeHtml(tl('loopSetupMissingDesc'))}</div>
             <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">${items.join('')}</div>
-            <button class="loop-prereq-retry" style="width:100%;padding:8px 14px;background:#22863a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">🔄 Retry Deploy</button>
+            <button class="loop-prereq-retry" style="width:100%;padding:8px 14px;background:#22863a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">🔄 ${escapeHtml(tl('loopSetupRetryDeploy'))}</button>
           </div>
         `;
         // Wire buttons
         bubble.querySelectorAll('.loop-prereq-btn').forEach(btn => {
-          btn.addEventListener('click', () => openSettings());
+          btn.addEventListener('click', () => {
+            const action = btn.dataset.action;
+            if (action === 'pushoo') {
+              if (typeof openPushooConfigDialog === 'function') {
+                openPushooConfigDialog(currentSessionId);
+              }
+              return;
+            }
+            openSettings();
+          });
         });
         bubble.querySelector('.loop-prereq-retry')?.addEventListener('click', () => {
           const input = document.getElementById('message-input');
@@ -3208,8 +3212,8 @@ const App = (() => {
     const cleanToken = (token || '').trim();
     const cleanOwner = (owner || '').trim();
     const cleanRepo = (repo || '').trim();
-    if (!cleanToken || !cleanOwner || !cleanRepo) {
-      throw new Error('Token, owner, and repo are required for PAT test.');
+    if (!cleanToken) {
+      throw new Error('Token is required for PAT test.');
     }
 
     const headers = {
@@ -3228,9 +3232,49 @@ const App = (() => {
       ? scopesHeader.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
       : [];
 
+    // Probe create-repository capability without creating anything:
+    // POST /user/repos with empty payload should return 422 if authorized.
+    const createRepoProbe = await fetch('https://api.github.com/user/repos', {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+    const canCreateRepo = createRepoProbe.status === 422;
+
+    const checks = [
+      `Create repo: ${canCreateRepo ? 'OK' : 'Missing'}`,
+    ];
+
+    let canManageRepo = false;
+    let canManageContents = false;
+    let canManageActions = false;
+
+    if (!cleanOwner || !cleanRepo) {
+      checks.push('Repo manage: Skipped (owner/repo not set)');
+      checks.push('Contents manage: Skipped (owner/repo not set)');
+      checks.push('Actions manage: Skipped (owner/repo not set)');
+      return {
+        passed: canCreateRepo,
+        login: user.login,
+        checks,
+        scopes,
+      };
+    }
+
     const repoResp = await fetch(`https://api.github.com/repos/${cleanOwner}/${cleanRepo}`, { headers });
     if (repoResp.status === 404) {
-      throw new Error(`Repository ${cleanOwner}/${cleanRepo} not found.`);
+      checks.push(`Repo manage: Skipped (${cleanOwner}/${cleanRepo} not found yet)`);
+      checks.push(`Contents manage: Skipped (${cleanOwner}/${cleanRepo} not found yet)`);
+      checks.push(`Actions manage: Skipped (${cleanOwner}/${cleanRepo} not found yet)`);
+      return {
+        passed: canCreateRepo,
+        login: user.login,
+        checks,
+        scopes,
+      };
     }
     if (!repoResp.ok) {
       throw new Error(`Failed to access repository (${repoResp.status}).`);
@@ -3238,10 +3282,9 @@ const App = (() => {
     const repoData = await repoResp.json();
     const permissions = repoData.permissions || {};
 
-    const canManageRepo = !!(permissions.admin || permissions.maintain || permissions.push);
-    const canManageContents = !!(permissions.push || permissions.maintain || permissions.admin);
+    canManageRepo = !!(permissions.admin || permissions.maintain || permissions.push);
+    canManageContents = !!(permissions.push || permissions.maintain || permissions.admin);
 
-    let canManageActions = false;
     const actionsPermResp = await fetch(`https://api.github.com/repos/${cleanOwner}/${cleanRepo}/actions/permissions`, { headers });
     if (actionsPermResp.ok) {
       canManageActions = true;
@@ -3253,12 +3296,10 @@ const App = (() => {
       }
     }
 
-    const passed = canManageRepo && canManageContents && canManageActions;
-    const checks = [
-      `Repo manage: ${canManageRepo ? 'OK' : 'Missing'}`,
-      `Contents manage: ${canManageContents ? 'OK' : 'Missing'}`,
-      `Actions manage: ${canManageActions ? 'OK' : 'Missing'}`,
-    ];
+    const passed = canCreateRepo && canManageRepo && canManageContents && canManageActions;
+    checks.push(`Repo manage: ${canManageRepo ? 'OK' : 'Missing'}`);
+    checks.push(`Contents manage: ${canManageContents ? 'OK' : 'Missing'}`);
+    checks.push(`Actions manage: ${canManageActions ? 'OK' : 'Missing'}`);
 
     return {
       passed,
@@ -3275,8 +3316,8 @@ const App = (() => {
     const btn = $('#test-github-pat-btn');
     const signature = buildPatVerificationSig(token, owner, repo);
 
-    if (!token || !owner || !repo) {
-      showToast('Please fill Token, Owner, and Repo first.', 'error');
+    if (!token) {
+      showToast('Please fill Token first.', 'error');
       return;
     }
 
@@ -3312,8 +3353,8 @@ const App = (() => {
     const btn = $('#test-action-pat-btn');
     const signature = buildPatVerificationSig(token, owner, repo);
 
-    if (!token || !owner || !repo) {
-      showToast('Please fill Token, Owner, and Repo first.', 'error');
+    if (!token) {
+      showToast('Please fill Token first.', 'error');
       return;
     }
 
@@ -3560,17 +3601,9 @@ const App = (() => {
         if (val) setSetting(key, val);
       }
 
-      // If user configures a dedicated action repo PAT, require a successful PAT test first.
       if (cfg.actionToken || cfg.actionOwner || cfg.actionRepo) {
         if (!cfg.actionToken || !cfg.actionOwner || !cfg.actionRepo) {
           showToast('Action PAT test requires token, owner, and repo.', 'error');
-          return;
-        }
-        const actionSig = buildPatVerificationSig(cfg.actionToken, cfg.actionOwner, cfg.actionRepo);
-        if (!isPatVerificationValid('action', actionSig)) {
-          showToast('Please test the Action GitHub PAT before saving settings.', 'error');
-          const btn = $('#test-action-pat-btn');
-          if (btn) { btn.scrollIntoView({ behavior: 'smooth', block: 'center' }); btn.focus(); }
           return;
         }
       }
@@ -3627,14 +3660,6 @@ const App = (() => {
           : !cfg.githubOwner ? '#set-github-owner' : '#set-github-repo';
         const el = $(firstEmpty);
         if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.focus(); }
-        return;
-      }
-
-      const storageSig = buildPatVerificationSig(cfg.githubToken, cfg.githubOwner, cfg.githubRepo);
-      if (!isPatVerificationValid('storage', storageSig)) {
-        showToast('Please test the GitHub storage PAT before saving settings.', 'error');
-        const btn = $('#test-github-pat-btn');
-        if (btn) { btn.scrollIntoView({ behavior: 'smooth', block: 'center' }); btn.focus(); }
         return;
       }
 
@@ -5236,7 +5261,7 @@ const App = (() => {
         <div class="setup-field">
           <label>${tl('setupPassphrase')}</label>
           <div class="password-input-group">
-            <input type="password" id="setup-passphrase" class="setup-input" placeholder="Enter a passphrase..." autocomplete="off" />
+            <input type="password" id="setup-passphrase" class="setup-input" placeholder="${escapeHtml(tl('setupPassphrasePlaceholder'))}" autocomplete="off" />
             <button type="button" class="password-toggle setup-toggle2" title="Show/hide">👁</button>
           </div>
         </div>
@@ -5358,8 +5383,8 @@ const App = (() => {
       const token = ghTokenInput?.value.trim();
       const owner = ghOwnerInput?.value.trim();
       const repo = ghRepoInput?.value.trim();
-      if (!token || !owner || !repo) {
-        showToast('Please fill Token, Owner, and Repo first.', 'error');
+      if (!token) {
+        showToast('Please fill Token first.', 'error');
         return;
       }
 
@@ -5394,13 +5419,6 @@ const App = (() => {
         const ghRepo = sysMsg.querySelector('#setup-gh-repo').value.trim();
         if (!ghToken || !ghOwner || !ghRepo) {
           showToast(tl('toastGithubFillOrSkip'), 'error');
-          return;
-        }
-
-        const guidedSig = buildPatVerificationSig(ghToken, ghOwner, ghRepo);
-        if (guidedPatVerifiedSig !== guidedSig || !isPatVerificationValid('guided', guidedSig)) {
-          showToast('Please test the GitHub PAT permissions before finishing setup.', 'error');
-          testPatBtn?.focus();
           return;
         }
 
@@ -5687,7 +5705,7 @@ const App = (() => {
     return new Promise((resolve) => {
       const dialog = $('#passphrase-dialog');
       const msgEl = $('#passphrase-message');
-      if (msgEl) msgEl.textContent = message || 'Enter the passphrase to decrypt this session.';
+      if (msgEl) msgEl.textContent = message || tl('decryptDesc');
       show(dialog);
       const input = $('#passphrase-input');
       input.value = '';
@@ -5976,13 +5994,21 @@ const App = (() => {
       });
     }
 
-    $('#pushoo-config-btn')?.addEventListener('click', () => {
-      if (!settingsTarget) return;
-      const cfg = getSessionConfig(settingsTarget);
+    let _pushooDialogTargetSessionId = null;
+
+    openPushooConfigDialog = (targetSessionId = null) => {
+      const effectiveSessionId = targetSessionId || settingsTarget || currentSessionId;
+      if (!effectiveSessionId) return;
+      _pushooDialogTargetSessionId = effectiveSessionId;
+      const cfg = getSessionConfig(effectiveSessionId);
       const pc = PushooNotifier.parseConfig(cfg.pushooConfig);
       _pushooEditChannels = pc.channels.map(ch => ({ ...ch }));
       renderChannelsList();
       show(pushooDialog);
+    };
+
+    $('#pushoo-config-btn')?.addEventListener('click', () => {
+      openPushooConfigDialog();
     });
 
     $('#pushoo-add-channel')?.addEventListener('click', () => {
@@ -5992,13 +6018,14 @@ const App = (() => {
     });
 
     $('#pushoo-config-save')?.addEventListener('click', () => {
-      if (!settingsTarget) return;
+      const targetSessionId = _pushooDialogTargetSessionId || settingsTarget || currentSessionId;
+      if (!targetSessionId) return;
       // Filter out channels with empty tokens
       const validChannels = _pushooEditChannels.filter(ch => ch.platform && ch.token?.trim());
       const pc = { channels: validChannels.map(ch => ({ platform: ch.platform, token: ch.token.trim() })) };
-      const cfg = getSessionConfig(settingsTarget);
+      const cfg = getSessionConfig(targetSessionId);
       cfg.pushooConfig = PushooNotifier.serializeConfig(pc);
-      saveSessionConfig(settingsTarget, cfg);
+      saveSessionConfig(targetSessionId, cfg);
       hide(pushooDialog);
       updatePushooStatusBadge();
       showToast(tl('toastPushooSaved'), 'success');
