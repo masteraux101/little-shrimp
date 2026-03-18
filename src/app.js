@@ -3176,6 +3176,171 @@ const App = (() => {
   // ─── Settings Panel ────────────────────────────────────────────────
 
   let settingsTarget = null; // session ID being edited
+  const _patVerification = {
+    storage: null,
+    action: null,
+    guided: null,
+  };
+
+  function buildPatVerificationSig(token, owner, repo) {
+    return `${(token || '').trim()}|${(owner || '').trim()}|${(repo || '').trim()}`;
+  }
+
+  function setPatVerification(type, signature, passed, message) {
+    _patVerification[type] = {
+      signature,
+      passed: !!passed,
+      message: message || '',
+      at: Date.now(),
+    };
+  }
+
+  function clearPatVerification(type) {
+    _patVerification[type] = null;
+  }
+
+  function isPatVerificationValid(type, signature) {
+    const state = _patVerification[type];
+    return !!(state && state.passed && state.signature === signature);
+  }
+
+  async function testGitHubPatPermissions({ token, owner, repo }) {
+    const cleanToken = (token || '').trim();
+    const cleanOwner = (owner || '').trim();
+    const cleanRepo = (repo || '').trim();
+    if (!cleanToken || !cleanOwner || !cleanRepo) {
+      throw new Error('Token, owner, and repo are required for PAT test.');
+    }
+
+    const headers = {
+      Authorization: `token ${cleanToken}`,
+      Accept: 'application/vnd.github.v3+json',
+    };
+
+    const userResp = await fetch('https://api.github.com/user', { headers });
+    if (!userResp.ok) {
+      throw new Error('Invalid GitHub token or token expired.');
+    }
+    const user = await userResp.json();
+
+    const scopesHeader = (userResp.headers.get('x-oauth-scopes') || '').trim();
+    const scopes = scopesHeader
+      ? scopesHeader.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      : [];
+
+    const repoResp = await fetch(`https://api.github.com/repos/${cleanOwner}/${cleanRepo}`, { headers });
+    if (repoResp.status === 404) {
+      throw new Error(`Repository ${cleanOwner}/${cleanRepo} not found.`);
+    }
+    if (!repoResp.ok) {
+      throw new Error(`Failed to access repository (${repoResp.status}).`);
+    }
+    const repoData = await repoResp.json();
+    const permissions = repoData.permissions || {};
+
+    const canManageRepo = !!(permissions.admin || permissions.maintain || permissions.push);
+    const canManageContents = !!(permissions.push || permissions.maintain || permissions.admin);
+
+    let canManageActions = false;
+    const actionsPermResp = await fetch(`https://api.github.com/repos/${cleanOwner}/${cleanRepo}/actions/permissions`, { headers });
+    if (actionsPermResp.ok) {
+      canManageActions = true;
+    } else {
+      const workflowsResp = await fetch(`https://api.github.com/repos/${cleanOwner}/${cleanRepo}/actions/workflows?per_page=1`, { headers });
+      const hasClassicWorkflowScope = scopes.includes('workflow') || scopes.includes('repo');
+      if (workflowsResp.ok && hasClassicWorkflowScope) {
+        canManageActions = true;
+      }
+    }
+
+    const passed = canManageRepo && canManageContents && canManageActions;
+    const checks = [
+      `Repo manage: ${canManageRepo ? 'OK' : 'Missing'}`,
+      `Contents manage: ${canManageContents ? 'OK' : 'Missing'}`,
+      `Actions manage: ${canManageActions ? 'OK' : 'Missing'}`,
+    ];
+
+    return {
+      passed,
+      login: user.login,
+      checks,
+      scopes,
+    };
+  }
+
+  async function testStoragePatFromSettings() {
+    const token = $('#set-github-token')?.value.trim();
+    const owner = $('#set-github-owner')?.value.trim();
+    const repo = $('#set-github-repo')?.value.trim();
+    const btn = $('#test-github-pat-btn');
+    const signature = buildPatVerificationSig(token, owner, repo);
+
+    if (!token || !owner || !repo) {
+      showToast('Please fill Token, Owner, and Repo first.', 'error');
+      return;
+    }
+
+    const originalText = btn?.textContent || '🧪 Test PAT Permissions';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ Testing...';
+    }
+    try {
+      const result = await testGitHubPatPermissions({ token, owner, repo });
+      if (!result.passed) {
+        setPatVerification('storage', signature, false, result.checks.join(' | '));
+        showToast(`PAT test failed: ${result.checks.join(' | ')}`, 'error');
+        return;
+      }
+      setPatVerification('storage', signature, true, result.checks.join(' | '));
+      showToast(`PAT test passed for ${result.login}: ${result.checks.join(' | ')}`, 'success');
+    } catch (e) {
+      setPatVerification('storage', signature, false, e.message);
+      showToast(`PAT test failed: ${e.message}`, 'error');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+  }
+
+  async function testActionPatFromSettings() {
+    const token = $('#set-action-token')?.value.trim();
+    const owner = $('#set-action-owner')?.value.trim();
+    const repo = $('#set-action-repo')?.value.trim();
+    const btn = $('#test-action-pat-btn');
+    const signature = buildPatVerificationSig(token, owner, repo);
+
+    if (!token || !owner || !repo) {
+      showToast('Please fill Token, Owner, and Repo first.', 'error');
+      return;
+    }
+
+    const originalText = btn?.textContent || '🧪 Test PAT Permissions';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ Testing...';
+    }
+    try {
+      const result = await testGitHubPatPermissions({ token, owner, repo });
+      if (!result.passed) {
+        setPatVerification('action', signature, false, result.checks.join(' | '));
+        showToast(`PAT test failed: ${result.checks.join(' | ')}`, 'error');
+        return;
+      }
+      setPatVerification('action', signature, true, result.checks.join(' | '));
+      showToast(`PAT test passed for ${result.login}: ${result.checks.join(' | ')}`, 'success');
+    } catch (e) {
+      setPatVerification('action', signature, false, e.message);
+      showToast(`PAT test failed: ${e.message}`, 'error');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+  }
 
   // Helper: Update pushoo status badge when opening settings
   function updatePushooStatusBadge() {
@@ -3394,6 +3559,21 @@ const App = (() => {
       for (const [key, val] of Object.entries(actionCreds)) {
         if (val) setSetting(key, val);
       }
+
+      // If user configures a dedicated action repo PAT, require a successful PAT test first.
+      if (cfg.actionToken || cfg.actionOwner || cfg.actionRepo) {
+        if (!cfg.actionToken || !cfg.actionOwner || !cfg.actionRepo) {
+          showToast('Action PAT test requires token, owner, and repo.', 'error');
+          return;
+        }
+        const actionSig = buildPatVerificationSig(cfg.actionToken, cfg.actionOwner, cfg.actionRepo);
+        if (!isPatVerificationValid('action', actionSig)) {
+          showToast('Please test the Action GitHub PAT before saving settings.', 'error');
+          const btn = $('#test-action-pat-btn');
+          if (btn) { btn.scrollIntoView({ behavior: 'smooth', block: 'center' }); btn.focus(); }
+          return;
+        }
+      }
     }
 
     // Auto-create action repo if token + owner + repo are all provided but repo doesn't exist
@@ -3447,6 +3627,14 @@ const App = (() => {
           : !cfg.githubOwner ? '#set-github-owner' : '#set-github-repo';
         const el = $(firstEmpty);
         if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.focus(); }
+        return;
+      }
+
+      const storageSig = buildPatVerificationSig(cfg.githubToken, cfg.githubOwner, cfg.githubRepo);
+      if (!isPatVerificationValid('storage', storageSig)) {
+        showToast('Please test the GitHub storage PAT before saving settings.', 'error');
+        const btn = $('#test-github-pat-btn');
+        if (btn) { btn.scrollIntoView({ behavior: 'smooth', block: 'center' }); btn.focus(); }
         return;
       }
 
@@ -5108,6 +5296,7 @@ const App = (() => {
               <input type="password" id="setup-gh-token" class="setup-input" placeholder="ghp_..." autocomplete="off" />
               <button type="button" class="password-toggle setup-toggle3" title="Show/hide">👁</button>
             </div>
+            <button id="setup-test-gh-pat" class="setup-btn-secondary" type="button" style="margin-top:8px;">🧪 Test PAT Permissions</button>
             <div class="setup-hint">${tl('setupGithubPatHint')}</div>
           </div>
           <div class="setup-field">
@@ -5130,7 +5319,12 @@ const App = (() => {
 
     const storageSel = sysMsg.querySelector('#setup-storage');
     const ghFields = sysMsg.querySelector('#setup-github-fields');
+    const ghTokenInput = sysMsg.querySelector('#setup-gh-token');
+    const ghOwnerInput = sysMsg.querySelector('#setup-gh-owner');
+    const ghRepoInput = sysMsg.querySelector('#setup-gh-repo');
+    const testPatBtn = sysMsg.querySelector('#setup-test-gh-pat');
     const savedSettings = getSettings();
+    let guidedPatVerifiedSig = null;
 
     storageSel.addEventListener('change', () => {
       if (storageSel.value === 'github') {
@@ -5152,6 +5346,46 @@ const App = (() => {
       inp.type = inp.type === 'password' ? 'text' : 'password';
     });
 
+    const clearGuidedVerification = () => {
+      guidedPatVerifiedSig = null;
+      clearPatVerification('guided');
+    };
+    ghTokenInput?.addEventListener('input', clearGuidedVerification);
+    ghOwnerInput?.addEventListener('input', clearGuidedVerification);
+    ghRepoInput?.addEventListener('input', clearGuidedVerification);
+
+    testPatBtn?.addEventListener('click', async () => {
+      const token = ghTokenInput?.value.trim();
+      const owner = ghOwnerInput?.value.trim();
+      const repo = ghRepoInput?.value.trim();
+      if (!token || !owner || !repo) {
+        showToast('Please fill Token, Owner, and Repo first.', 'error');
+        return;
+      }
+
+      const signature = buildPatVerificationSig(token, owner, repo);
+      const originalText = testPatBtn.textContent;
+      testPatBtn.disabled = true;
+      testPatBtn.textContent = '⏳ Testing...';
+      try {
+        const result = await testGitHubPatPermissions({ token, owner, repo });
+        if (!result.passed) {
+          setPatVerification('guided', signature, false, result.checks.join(' | '));
+          showToast(`PAT test failed: ${result.checks.join(' | ')}`, 'error');
+          return;
+        }
+        guidedPatVerifiedSig = signature;
+        setPatVerification('guided', signature, true, result.checks.join(' | '));
+        showToast(`PAT test passed for ${result.login}: ${result.checks.join(' | ')}`, 'success');
+      } catch (e) {
+        setPatVerification('guided', signature, false, e.message);
+        showToast(`PAT test failed: ${e.message}`, 'error');
+      } finally {
+        testPatBtn.disabled = false;
+        testPatBtn.textContent = originalText;
+      }
+    });
+
     const finishSetup = async (skipGithub) => {
       const cfg = getSessionConfig(_setupSessionId);
       if (!skipGithub && storageSel.value === 'github') {
@@ -5160,6 +5394,13 @@ const App = (() => {
         const ghRepo = sysMsg.querySelector('#setup-gh-repo').value.trim();
         if (!ghToken || !ghOwner || !ghRepo) {
           showToast(tl('toastGithubFillOrSkip'), 'error');
+          return;
+        }
+
+        const guidedSig = buildPatVerificationSig(ghToken, ghOwner, ghRepo);
+        if (guidedPatVerifiedSig !== guidedSig || !isPatVerificationValid('guided', guidedSig)) {
+          showToast('Please test the GitHub PAT permissions before finishing setup.', 'error');
+          testPatBtn?.focus();
           return;
         }
 
@@ -5610,8 +5851,17 @@ const App = (() => {
     $('#set-model')?.addEventListener('change', updateModelDimensionUI);
     $('#set-enable-thinking')?.addEventListener('change', toggleThinkingFields);
     $('#auto-create-repo-btn')?.addEventListener('click', autoCreateGitHubRepo);
+    $('#test-github-pat-btn')?.addEventListener('click', testStoragePatFromSettings);
     $('#set-action-use-storage')?.addEventListener('change', toggleActionFields);
     $('#auto-create-action-repo-btn')?.addEventListener('click', autoCreateActionRepo);
+    $('#test-action-pat-btn')?.addEventListener('click', testActionPatFromSettings);
+
+    ['#set-github-token', '#set-github-owner', '#set-github-repo'].forEach((selector) => {
+      $(selector)?.addEventListener('input', () => clearPatVerification('storage'));
+    });
+    ['#set-action-token', '#set-action-owner', '#set-action-repo'].forEach((selector) => {
+      $(selector)?.addEventListener('input', () => clearPatVerification('action'));
+    });
 
     $('#new-session-btn')?.addEventListener('click', () => {
       startGuidedSetup();
