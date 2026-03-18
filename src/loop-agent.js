@@ -7,7 +7,6 @@
 
 import GitHubActions from './github-actions.js';
 import PushooNotifier from './pushoo.js';
-import Crypto from './crypto.js';
 import { t, getLang } from './i18n.js';
 
 const LoopAgent = (() => {
@@ -69,6 +68,7 @@ const LoopAgent = (() => {
       maxRuntime = 18000,
       systemPrompt = '',
       historyPath = 'loop-agent/history',
+      dataRepository = '',
     } = opts;
 
     return [
@@ -105,15 +105,31 @@ const LoopAgent = (() => {
       '          PUSHOO_CHANNELS: ${{ secrets.PUSHOO_CHANNELS }}',
       '          GH_PAT: ${{ secrets.GH_PAT }}',
       '          GITHUB_REPOSITORY: ${{ github.repository }}',
+      `          LOOP_DATA_REPOSITORY: "${dataRepository || '${{ github.repository }}'}"`,
       `          LOOP_WORKFLOW_FILE: "${workflowFile}"`,
       `          LOOP_HISTORY_PATH: "${historyPath}"`,
       `          LOOP_POLL_INTERVAL: "${pollInterval}"`,
       `          LOOP_MAX_RUNTIME: "${maxRuntime}"`,
       ...(systemPrompt ? [`          LOOP_SYSTEM_PROMPT: "${systemPrompt.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`] : []),
-      '          LOOP_ENCRYPT_KEY: ${{ secrets.LOOP_ENCRYPT_KEY }}',
       '        run: node loop-agent/runner.js',
       '',
     ].join('\n') + '\n';
+  }
+
+  async function ensurePrivateRepo(actionConfig, targetOwner, targetRepo) {
+    const { token } = actionConfig;
+    const exists = await GitHubActions.repoExists(token, targetOwner, targetRepo);
+    if (exists) return { owner: targetOwner, repo: targetRepo, created: false };
+
+    const user = await GitHubActions.getUser(token);
+    if (user.login !== targetOwner) {
+      throw new Error(
+        `Cannot auto-create missing repo ${targetOwner}/${targetRepo}. PAT owner is ${user.login}, please create this private repo manually or use your own owner.`
+      );
+    }
+
+    await GitHubActions.createRepo(token, targetRepo, true);
+    return { owner: targetOwner, repo: targetRepo, created: true };
   }
 
   /**
@@ -133,6 +149,7 @@ const LoopAgent = (() => {
   async function deploy(opts) {
     const {
       actionConfig,
+      dataRepo,
       runnerScript,
       subAgentScript,
       browserAgentScript,
@@ -162,6 +179,7 @@ const LoopAgent = (() => {
       maxRuntime: agentOpts.maxRuntime,
       systemPrompt: agentOpts.systemPrompt,
       historyPath: agentOpts.historyPath,
+      dataRepository: dataRepo ? `${dataRepo.owner}/${dataRepo.repo}` : `${actionConfig.owner}/${actionConfig.repo}`,
     });
 
     // 2. Push files to repo
@@ -184,7 +202,6 @@ const LoopAgent = (() => {
     if (secrets.pushooChannels) secretMap.push({ name: 'PUSHOO_CHANNELS', value: secrets.pushooChannels });
     // Use the user's PAT (not the default GITHUB_TOKEN) for repo operations
     if (actionConfig.token)     secretMap.push({ name: 'GH_PAT',          value: actionConfig.token });
-    if (secrets.encryptKey)      secretMap.push({ name: 'LOOP_ENCRYPT_KEY', value: secrets.encryptKey });
 
     console.log(`[LoopAgent] Secrets to sync: ${secretMap.map(s => s.name).join(', ')}`);
     for (const s of secretMap) {
@@ -219,10 +236,14 @@ const LoopAgent = (() => {
     progress('done', t(lang, 'loopStepDone'));
 
     const repoUrl = `https://github.com/${actionConfig.owner}/${actionConfig.repo}`;
+    const dataRepoUrl = dataRepo
+      ? `https://github.com/${dataRepo.owner}/${dataRepo.repo}`
+      : repoUrl;
     return {
       loopKey,
       workflowFile,
       repoUrl,
+      dataRepoUrl,
       synced,
       errors,
     };
@@ -233,8 +254,15 @@ const LoopAgent = (() => {
    * If encryptKey is provided, encrypted content will be decrypted.
    * Returns an array of { role: 'user'|'assistant', content, ts }.
    */
-  async function fetchHistory(actionConfig, loopKey, historyPath = 'loop-agent/history', encryptKey = null) {
-    const { token, owner, repo } = actionConfig;
+  function resolveRepoTarget(actionConfig, repoOverride = null) {
+    if (repoOverride?.owner && repoOverride?.repo) {
+      return { token: actionConfig.token, owner: repoOverride.owner, repo: repoOverride.repo };
+    }
+    return actionConfig;
+  }
+
+  async function fetchHistory(actionConfig, loopKey, historyPath = 'loop-agent/history', repoOverride = null) {
+    const { token, owner, repo } = resolveRepoTarget(actionConfig, repoOverride);
     const filePath = `${historyPath}/${loopKey}.json`;
     const resp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=main`,
@@ -250,18 +278,7 @@ const LoopAgent = (() => {
     const data = await resp.json();
     const binary = atob(data.content.replace(/\n/g, ''));
     const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-    let content = new TextDecoder('utf-8').decode(bytes);
-    // Detect encrypted content
-    if (content.startsWith('ENCRYPTED:')) {
-      if (!encryptKey) {
-        throw new Error('Content is encrypted. Please provide a decryption key.');
-      }
-      try {
-        content = await Crypto.decrypt(encryptKey, content.slice('ENCRYPTED:'.length));
-      } catch (e) {
-        throw new Error(`Decryption failed — wrong key? ${e.message}`);
-      }
-    }
+    const content = new TextDecoder('utf-8').decode(bytes);
     return JSON.parse(content);
   }
 
@@ -269,8 +286,8 @@ const LoopAgent = (() => {
    * Clear the loop agent's persistent memory file (MEMORY.md) from the GitHub repo.
    * If encryptKey is provided, the cleared content will be encrypted.
    */
-  async function clearMemory(actionConfig, memoryPath = 'loop-agent/MEMORY.md', encryptKey = null) {
-    const { token, owner, repo } = actionConfig;
+  async function clearMemory(actionConfig, memoryPath = 'loop-agent/MEMORY.md', repoOverride = null) {
+    const { token, owner, repo } = resolveRepoTarget(actionConfig, repoOverride);
     // First get the file SHA (required for deletion)
     const getResp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/contents/${memoryPath}?ref=main`,
@@ -285,11 +302,7 @@ const LoopAgent = (() => {
     if (!getResp.ok) throw new Error(`Failed to read memory file: ${getResp.status}`);
     const fileData = await getResp.json();
 
-    // Prepare cleared content (encrypt if key provided)
-    let clearedContent = '# Agent Memory\n';
-    if (encryptKey) {
-      clearedContent = 'ENCRYPTED:' + await Crypto.encrypt(encryptKey, clearedContent);
-    }
+    const clearedContent = '# Agent Memory\n';
 
     // Delete the file
     const delResp = await fetch(
@@ -322,11 +335,11 @@ const LoopAgent = (() => {
    * @param {Object} actionConfig - { token, owner, repo }
    * @param {string} loopKey - The loop agent key
    * @param {string} text - Message text to send
-   * @param {Object} opts - { upstashUrl, upstashToken, encryptKey }
+   * @param {Object} opts - { upstashUrl, upstashToken, repoOverride }
    * @returns {{ channel: 'upstash' | 'repo' }}
    */
   async function sendIntervention(actionConfig, loopKey, text, opts = {}) {
-    const { upstashUrl, upstashToken, encryptKey } = opts;
+    const { upstashUrl, upstashToken, repoOverride } = opts;
     const message = JSON.stringify({
       ts: Date.now(),
       from: 'user',
@@ -351,12 +364,9 @@ const LoopAgent = (() => {
     }
 
     // Repo-based fallback
-    const { token, owner, repo } = actionConfig;
+    const { token, owner, repo } = resolveRepoTarget(actionConfig, repoOverride);
     const inboxPath = `loop-agent/channel/${loopKey}.inbox.json`;
-    let content = message;
-    if (encryptKey) {
-      content = 'ENCRYPTED:' + await Crypto.encrypt(encryptKey, content);
-    }
+    const content = message;
 
     // Get existing file SHA if it exists (for update)
     const getResp = await fetch(
@@ -395,11 +405,11 @@ const LoopAgent = (() => {
    *
    * @param {Object} actionConfig - { token, owner, repo }
    * @param {string} loopKey - The loop agent key
-   * @param {Object} opts - { upstashUrl, upstashToken, encryptKey }
+   * @param {Object} opts - { upstashUrl, upstashToken, repoOverride }
    * @returns {Object|null}
    */
   async function pollIntervention(actionConfig, loopKey, opts = {}) {
-    const { upstashUrl, upstashToken, encryptKey } = opts;
+    const { upstashUrl, upstashToken, repoOverride } = opts;
 
     if (upstashUrl && upstashToken) {
       // Upstash mode — read outbox
@@ -432,7 +442,7 @@ const LoopAgent = (() => {
     }
 
     // Repo-based fallback — read outbox file
-    const { token, owner, repo } = actionConfig;
+    const { token, owner, repo } = resolveRepoTarget(actionConfig, repoOverride);
     const outboxPath = `loop-agent/channel/${loopKey}.outbox.json`;
     const resp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/contents/${outboxPath}?ref=main`,
@@ -443,13 +453,7 @@ const LoopAgent = (() => {
     const fileData = await resp.json();
     const binary = atob(fileData.content.replace(/\n/g, ''));
     const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-    let content = new TextDecoder('utf-8').decode(bytes);
-
-    // Decrypt if needed
-    if (content.startsWith('ENCRYPTED:') && encryptKey) {
-      try { content = await Crypto.decrypt(encryptKey, content.slice('ENCRYPTED:'.length)); }
-      catch { return null; }
-    }
+    const content = new TextDecoder('utf-8').decode(bytes);
 
     try {
       const msg = JSON.parse(content);
@@ -457,10 +461,6 @@ const LoopAgent = (() => {
 
       // Mark as read by writing back
       const updated = JSON.stringify({ ...msg, read: true });
-      let writeContent = updated;
-      if (encryptKey) {
-        writeContent = 'ENCRYPTED:' + await Crypto.encrypt(encryptKey, updated);
-      }
       await fetch(
         `https://api.github.com/repos/${owner}/${repo}/contents/${outboxPath}`,
         {
@@ -472,7 +472,7 @@ const LoopAgent = (() => {
           },
           body: JSON.stringify({
             message: '[loop-agent] Mark outbox read',
-            content: btoa(unescape(encodeURIComponent(writeContent))),
+            content: btoa(unescape(encodeURIComponent(updated))),
             sha: fileData.sha,
             branch: 'main',
           }),
@@ -510,6 +510,7 @@ const LoopAgent = (() => {
     getBrowserAgentScript,
     generateLoopKey,
     generateWorkflowYaml,
+    ensurePrivateRepo,
     deploy,
     fetchHistory,
     clearMemory,

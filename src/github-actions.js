@@ -272,13 +272,13 @@ const GitHubActions = (() => {
    * @param {string} opts.scheduleText  - Human description, e.g. 'Daily 9:00 UTC'
    * @param {string} opts.scriptFilename - e.g. 'daily-report.py'
    * @param {string} opts.language       - 'python' | 'node' | 'bash'
-   * @param {string} opts.artifactDir    - e.g. 'artifacts'
+  * @param {string} opts.artifactDir    - e.g. 'artifact'
    * @returns {string} The workflow YAML content
    */
   function generateScheduleWorkflow(opts) {
     const {
       name, slug, cron, scheduleText,
-      scriptFilename, language, artifactDir = 'artifacts',
+      scriptFilename, language, artifactDir = 'artifact',
     } = opts;
 
     const entrypoint = `${artifactDir}/${scriptFilename}`;

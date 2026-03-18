@@ -30,10 +30,17 @@ const App = (() => {
   let currentLang = 'en';
 
   // ─── Loop State ─────────────────────────────────────────────────────
-  let _loopEncryptKey = null;     // Encryption key for loop sync operations (in-memory only)
   let _loopConnectedKey = null;   // Currently connected loop agent key (null = not connected)
   let _loopPollTimer = null;      // Timeout for polling loop agent responses
   let _loopPollReset = null;      // Function to reset adaptive polling to fast mode
+
+  function getLoopDataRepoForKey(loopKey) {
+    if (!currentSessionId || !loopKey) return null;
+    const cfg = getSessionConfig(currentSessionId);
+    const mapped = cfg.loopDataRepos?.[loopKey];
+    if (mapped?.owner && mapped?.repo) return mapped;
+    return null;
+  }
 
   function disconnectLoopAgent() {
     if (_loopPollTimer) {
@@ -151,7 +158,7 @@ const App = (() => {
           // Remove key from session config
           const cfgDel = getSessionConfig(currentSessionId);
           cfgDel.loopKeys = (cfgDel.loopKeys || []).filter(k => k !== key);
-          if (cfgDel.loopEncrypted) delete cfgDel.loopEncrypted[key];
+          if (cfgDel.loopDataRepos) delete cfgDel.loopDataRepos[key];
           saveSessionConfig(currentSessionId, cfgDel);
 
           // Remove card from DOM
@@ -634,6 +641,8 @@ const App = (() => {
     const useStorageHint = $('#set-action-use-storage')?.closest('.settings-field')?.querySelector('.hint');
     if (useStorageHint) useStorageHint.textContent = tl('useStorageRepoHint');
     setText('label[for="set-action-token"]', tl('githubToken'));
+    const actionPatHint = $('#set-action-token')?.parentElement?.parentElement?.querySelector('.hint');
+    if (actionPatHint) actionPatHint.textContent = tl('githubActionPatHint');
     setText('label[for="set-action-owner"]', tl('repoOwner'));
     setText('label[for="set-action-repo"]', tl('repoName'));
     setText('#auto-create-action-repo-btn', `🚀 ${tl('actionAutoRepo')}`);
@@ -1337,22 +1346,54 @@ const App = (() => {
   function getSlashCommands() {
     return [
       { cmd: '/schedule',       desc: tl('slashScheduleDesc') },
-      { cmd: '/github status',  desc: tl('slashGithubStatusDesc') },
-      { cmd: '/github run',     desc: tl('slashGithubRunDesc') },
-      { cmd: '/github delete',  desc: tl('slashGithubDeleteDesc') },
+      { cmd: '/github',         desc: tl('slashGithubDesc') },
       { cmd: '/loop',           desc: tl('slashLoopDesc') },
-      { cmd: '/loop status',    desc: tl('slashLoopStatusDesc') },
-      { cmd: '/loop connect',   desc: tl('slashLoopConnectDesc') },
-      { cmd: '/loop disconnect', desc: tl('slashLoopDisconnectDesc') },
-      { cmd: '/loop channel',  desc: tl('slashLoopChannelDesc') },
-      { cmd: '/loop dashboard', desc: tl('slashLoopDashboardDesc') },
-      { cmd: '/loop memory clear', desc: 'Clear the loop agent persistent memory file' },
       { cmd: '/skills',         desc: tl('slashSkillsDesc') },
       { cmd: '/soul',           desc: tl('slashSoulDesc') },
-      { cmd: '/soul list',      desc: tl('slashSoulListDesc') },
       { cmd: '/compact',        desc: tl('slashCompactDesc') },
       { cmd: '/clear',          desc: tl('slashClearDesc') },
     ];
+  }
+
+  function showSlashCommandMenu(baseCmd, title, options) {
+    addMessageBubble('user', baseCmd);
+    const bubble = addMessageBubble('model', '');
+    const rows = options.map((opt, idx) => `
+      <button class="command-menu-btn" data-idx="${idx}">
+        <div class="command-menu-line1">
+          <span class="command-menu-cmd">${escapeHtml(opt.cmd)}</span>
+          <span class="command-menu-label">${escapeHtml(opt.label)}</span>
+        </div>
+        ${opt.desc ? `<div class="command-menu-desc">${escapeHtml(opt.desc)}</div>` : ''}
+      </button>
+    `).join('');
+
+    bubble.innerHTML = `
+      <div class="command-menu-card">
+        <div class="command-menu-title">${escapeHtml(title)}</div>
+        <div class="command-menu-subtitle">${escapeHtml(tl('commandMenuSubtitle'))}</div>
+        <div class="command-menu-list">${rows}</div>
+      </div>
+    `;
+
+    bubble.querySelectorAll('.command-menu-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.idx, 10);
+        const option = options[idx];
+        const input = $('#message-input');
+        if (!input || !option) return;
+        input.value = option.cmd;
+        input.focus();
+        autoResizeInput();
+        if (option.prefillOnly) {
+          input.setSelectionRange(input.value.length, input.value.length);
+          return;
+        }
+        $('#send-btn')?.click();
+      });
+    });
+
+    scrollToBottom();
   }
 
   let _slashSelectedIdx = -1;
@@ -1427,6 +1468,28 @@ const App = (() => {
 
   async function handleSlashCommand(text) {
     const cmd = text.trim().toLowerCase();
+
+    if (cmd === '/loop') {
+      showSlashCommandMenu('/loop', tl('loopMenuTitle'), [
+        { cmd: '/loop deploy', label: tl('loopMenuDeployLabel'), desc: tl('slashLoopDesc') },
+        { cmd: '/loop status', label: tl('loopMenuStatusLabel'), desc: tl('slashLoopStatusDesc') },
+        { cmd: '/loop connect', label: tl('loopMenuConnectLabel'), desc: tl('slashLoopConnectDesc') },
+        { cmd: '/loop disconnect', label: tl('loopMenuDisconnectLabel'), desc: tl('slashLoopDisconnectDesc') },
+        { cmd: '/loop channel', label: tl('loopMenuChannelLabel'), desc: tl('slashLoopChannelDesc') },
+        { cmd: '/loop dashboard', label: tl('loopMenuDashboardLabel'), desc: tl('slashLoopDashboardDesc') },
+        { cmd: '/loop memory clear', label: tl('loopMenuMemoryClearLabel'), desc: tl('slashLoopMemoryClearDesc') },
+      ]);
+      return true;
+    }
+
+    if (cmd === '/github') {
+      showSlashCommandMenu('/github', tl('githubMenuTitle'), [
+        { cmd: '/github status', label: tl('githubMenuStatusLabel'), desc: tl('slashGithubStatusDesc') },
+        { cmd: '/github run', label: tl('githubMenuRunLabel'), desc: tl('slashGithubRunDesc') },
+        { cmd: '/github delete', label: tl('githubMenuDeleteLabel'), desc: tl('slashGithubDeleteDesc') },
+      ]);
+      return true;
+    }
 
     if (cmd === '/clear') {
       if (!currentSessionId) { showToast(tl('toastNoActiveSession'), 'info'); return true; }
@@ -1605,8 +1668,17 @@ const App = (() => {
     }
 
     if (cmd === '/soul') {
+      showSlashCommandMenu('/soul', tl('soulMenuTitle'), [
+        { cmd: '/soul info', label: tl('soulMenuInfoLabel'), desc: tl('slashSoulDesc') },
+        { cmd: '/soul list', label: tl('soulMenuListLabel'), desc: tl('slashSoulListDesc') },
+        { cmd: '/soul ', label: tl('soulMenuSetLabel'), desc: tl('soulMenuSetDesc'), prefillOnly: true },
+      ]);
+      return true;
+    }
+
+    if (cmd === '/soul info') {
       const soulUrl = getSessionSetting('soulUrl');
-      addMessageBubble('user', '/soul');
+      addMessageBubble('user', '/soul info');
       addMessageBubble(
         'model',
         `**${tl('msgCurrentSoul')}:** ${currentSoulName || tl('msgNone')}\n**URL:** ${soulUrl || tl('msgNotSet')}\n**${tl('msgSkillsLoaded')}:** ${loadedSkillCount}\n\n_${tl('msgSoulListTip')}_`
@@ -2043,7 +2115,7 @@ const App = (() => {
       return true;
     }
 
-    if (cmd === '/github status' || cmd === '/github') {
+    if (cmd === '/github status') {
       addMessageBubble('user', text.trim());
       let config;
       try {
@@ -2319,7 +2391,8 @@ const App = (() => {
       const bubble = addMessageBubble('model', `⏳ Clearing loop agent memory…`);
       (async () => {
         try {
-          const result = await LoopAgent.clearMemory(config, 'loop-agent/MEMORY.md', _loopEncryptKey);
+          const repoOverride = getLoopDataRepoForKey(_loopConnectedKey);
+          const result = await LoopAgent.clearMemory(config, 'loop-agent/MEMORY.md', repoOverride);
           if (result.cleared) {
             bubble.innerHTML = renderMarkdown(`✅ Loop agent memory (MEMORY.md) has been cleared.`);
           } else {
@@ -2361,7 +2434,7 @@ const App = (() => {
       const cfg = getSessionConfig(currentSessionId);
       const upstashUrl = cfg.upstashUrl || '';
       const upstashToken = cfg.upstashToken || '';
-      const encryptKey = _loopEncryptKey || '';
+      const repoOverride = getLoopDataRepoForKey(loopKeyArg);
 
       const bubble = addMessageBubble('model', `⏳ Connecting to loop agent **${escapeHtml(loopKeyArg)}**…`);
 
@@ -2370,10 +2443,7 @@ const App = (() => {
           // Fetch history from the repo to show past conversation
           let historyMessages = [];
           try {
-            const syncCfg = getSessionConfig(currentSessionId);
-            const needsDecrypt = syncCfg.loopEncrypted?.[loopKeyArg];
-            const key = needsDecrypt ? encryptKey : null;
-            historyMessages = await LoopAgent.fetchHistory(config, loopKeyArg, 'loop-agent/history', key);
+            historyMessages = await LoopAgent.fetchHistory(config, loopKeyArg, 'loop-agent/history', repoOverride);
           } catch (e) {
             console.warn(`[Loop Connect] History fetch failed: ${e.message}`);
           }
@@ -2436,7 +2506,7 @@ const App = (() => {
               const response = await LoopAgent.pollIntervention(pollConfig, _loopConnectedKey, {
                 upstashUrl: pollCfg.upstashUrl || '',
                 upstashToken: pollCfg.upstashToken || '',
-                encryptKey: _loopEncryptKey || '',
+                repoOverride: getLoopDataRepoForKey(_loopConnectedKey),
               });
               if (response && response.text) {
                 addMessageBubble('model', `🤖 **${escapeHtml(_loopConnectedKey)}**:\n\n${response.text}`);
@@ -2503,7 +2573,7 @@ const App = (() => {
           await LoopAgent.sendIntervention(config, _loopConnectedKey, controlMsg, {
             upstashUrl: cfg.upstashUrl || '',
             upstashToken: cfg.upstashToken || '',
-            encryptKey: _loopEncryptKey || '',
+            repoOverride: getLoopDataRepoForKey(_loopConnectedKey),
           });
           const summary = PushooNotifier.getChannelSummary({ channels: selectedChannels });
           return { success: true, summary };
@@ -2622,8 +2692,8 @@ const App = (() => {
       return true;
     }
 
-    if (cmd === '/loop') {
-      addMessageBubble('user', '/loop');
+    if (cmd === '/loop deploy') {
+      addMessageBubble('user', '/loop deploy');
 
       // Check prerequisites and guide user if missing
       const prereqs = checkLoopPrerequisites();
@@ -2644,7 +2714,7 @@ const App = (() => {
             <div style="font-weight:600;font-size:15px;margin-bottom:12px;">🔄 Loop Agent Setup</div>
             <div style="opacity:.8;margin-bottom:14px;font-size:13px;">Complete the following before deploying:</div>
             <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">${items.join('')}</div>
-            <button class="loop-prereq-retry" style="width:100%;padding:8px 14px;background:#22863a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">🔄 Retry /loop</button>
+            <button class="loop-prereq-retry" style="width:100%;padding:8px 14px;background:#22863a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">🔄 Retry Deploy</button>
           </div>
         `;
         // Wire buttons
@@ -2653,7 +2723,7 @@ const App = (() => {
         });
         bubble.querySelector('.loop-prereq-retry')?.addEventListener('click', () => {
           const input = document.getElementById('message-input');
-          if (input) { input.value = '/loop'; }
+          if (input) { input.value = '/loop deploy'; }
           document.getElementById('send-btn')?.click();
         });
         return true;
@@ -2692,12 +2762,6 @@ const App = (() => {
       bubble.innerHTML = `
         <div class="schedule-wizard">
           <div class="schedule-wizard-title">🔄 ${tl('msgDeployLoopAgent')}</div>
-
-          <div style="background:rgba(34,134,58,.12);border:1px solid rgba(34,134,58,.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;">
-            <label class="schedule-field-label" style="margin-bottom:4px;">🔐 Encryption Key</label>
-            <input id="loop-encrypt-key" class="schedule-input" type="password" placeholder="Enter a passphrase to encrypt repo files…" autocomplete="off" style="font-size:14px;padding:10px 12px;border:2px solid rgba(34,134,58,.5);" />
-            <div class="hint" style="margin-top:4px;color:rgba(255,255,255,.5);">AES-256-GCM encrypted. You'll need this key later.</div>
-          </div>
 
           <label class="schedule-field-label">${tl('msgLoopSystemPrompt')}</label>
           <textarea id="loop-system-prompt" class="schedule-input" rows="2" placeholder="Optional: custom system prompt..."
@@ -2759,7 +2823,6 @@ const App = (() => {
         const systemPrompt = bubble.querySelector('#loop-system-prompt').value.trim();
         const pollInterval = parseInt(bubble.querySelector('#loop-poll-interval').value);
         const maxRuntime = parseInt(bubble.querySelector('#loop-max-runtime').value);
-        const encryptKey = bubble.querySelector('#loop-encrypt-key').value.trim() || '';
 
         try {
           // Load runner script and sub-agent script
@@ -2775,8 +2838,17 @@ const App = (() => {
           // Log pushoo config being synced
           console.log('[Loop Deploy] Pushoo channels:', freshPushoo.channels.length);
 
+          // Loop data must live in a dedicated private repo (separate from GHA session repo)
+          const preferredOwner = getSessionSetting('githubOwner') || config.owner;
+          const preferredRepoRaw = getSessionSetting('githubRepo') || `${config.repo}-loop-private`;
+          const preferredRepo = (preferredRepoRaw === config.repo && preferredOwner === config.owner)
+            ? `${config.repo}-loop-private`
+            : preferredRepoRaw;
+          const dataRepo = await LoopAgent.ensurePrivateRepo(config, preferredOwner, preferredRepo);
+
           const result = await LoopAgent.deploy({
             actionConfig: config,
+            dataRepo,
             runnerScript,
             subAgentScript,
             browserAgentScript,
@@ -2795,7 +2867,6 @@ const App = (() => {
               upstashUrl: getSessionSetting('upstashUrl') || undefined,
               upstashToken: getSessionSetting('upstashToken') || undefined,
               pushooChannels: freshPushoo.channels.length > 0 ? JSON.stringify(freshPushoo.channels) : undefined,
-              encryptKey: encryptKey || undefined,
             },
             onProgress: (step, detail) => {
               deployBtn.textContent = `⏳ ${detail}`;
@@ -2806,17 +2877,13 @@ const App = (() => {
           const cfg = getSessionConfig(currentSessionId);
           if (!cfg.loopKeys) cfg.loopKeys = [];
           if (!cfg.loopKeys.includes(loopKey)) cfg.loopKeys.push(loopKey);
+          if (!cfg.loopDataRepos) cfg.loopDataRepos = {};
+          cfg.loopDataRepos[loopKey] = { owner: dataRepo.owner, repo: dataRepo.repo };
           saveSessionConfig(currentSessionId, cfg);
 
           // Show success UI
           const repoUrl = result.repoUrl;
-          // Store encryption key indicator in session config (not the key itself)
-          const cfg2 = getSessionConfig(currentSessionId);
-          if (encryptKey) {
-            if (!cfg2.loopEncrypted) cfg2.loopEncrypted = {};
-            cfg2.loopEncrypted[loopKey] = true;
-            saveSessionConfig(currentSessionId, cfg2);
-          }
+          const dataRepoUrl = result.dataRepoUrl || repoUrl;
           bubble.innerHTML = `
             <div style="padding:12px;">
               <div style="font-weight:600;font-size:15px;margin-bottom:10px;">✅ Loop Agent Deployed!</div>
@@ -2828,7 +2895,9 @@ const App = (() => {
               <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;font-size:12px;opacity:.7;">
                 <span>🤖 ${escapeHtml(provider)}/${escapeHtml(model)}</span>
                 <span>·</span>
-                <span>📂 <a href="${repoUrl}" target="_blank" style="color:#8ec5fc;">${escapeHtml(config.owner)}/${escapeHtml(config.repo)}</a></span>
+                <span>⚡ GHA: <a href="${repoUrl}" target="_blank" style="color:#8ec5fc;">${escapeHtml(config.owner)}/${escapeHtml(config.repo)}</a></span>
+                <span>·</span>
+                <span>🔒 Data: <a href="${dataRepoUrl}" target="_blank" style="color:#8ec5fc;">${escapeHtml(dataRepo.owner)}/${escapeHtml(dataRepo.repo)}</a></span>
                 <span>·</span>
                 <span>⏱ ${maxRuntime / 3600}h</span>
                 ${result.errors.length ? `<span style="color:#e74c3c;">· ❌ ${result.errors.join('; ')}</span>` : ''}
@@ -2903,10 +2972,10 @@ const App = (() => {
           const cfg = getSessionConfig(currentSessionId);
           const upstashUrl = cfg.upstashUrl || '';
           const upstashToken = cfg.upstashToken || '';
-          const encryptKey = _loopEncryptKey || '';
+          const repoOverride = getLoopDataRepoForKey(_loopConnectedKey);
 
           const result = await LoopAgent.sendIntervention(config, _loopConnectedKey, text, {
-            upstashUrl, upstashToken, encryptKey,
+            upstashUrl, upstashToken, repoOverride,
           });
           bubble.innerHTML = renderMarkdown(`📤 Sent via **${result.channel}**. Waiting for reply…`);
           scrollToBottom();
@@ -3226,7 +3295,7 @@ const App = (() => {
     $('#set-action-repo').value = get('actionRepo', '');
     $('#set-action-branch').value = get('actionBranch', 'main');
     $('#set-action-workflow').value = get('actionWorkflow', 'execute.yml');
-    $('#set-action-dir').value = get('actionArtifactDir', 'artifacts');
+    $('#set-action-dir').value = 'artifact';
 
     // Upstash settings (optional, for loop agent browser intervention)
     $('#set-upstash-url').value = get('upstashUrl', '');
@@ -3309,7 +3378,7 @@ const App = (() => {
     cfg.actionUseStorage = $('#set-action-use-storage').checked;
     cfg.actionBranch = $('#set-action-branch').value.trim() || 'main';
     cfg.actionWorkflow = $('#set-action-workflow').value.trim() || 'execute.yml';
-    cfg.actionArtifactDir = $('#set-action-dir').value.trim() || 'artifacts';
+    cfg.actionArtifactDir = 'artifact';
 
     // Action repo credentials — same empty-string handling
     const actionCreds = {
@@ -3651,7 +3720,7 @@ const App = (() => {
       repo,
       branch: getSessionSetting('actionBranch', 'main'),
       workflow: getSessionSetting('actionWorkflow', 'execute.yml'),
-      artifactDir: getSessionSetting('actionArtifactDir', 'artifacts'),
+      artifactDir: 'artifact',
     };
   }
 
@@ -4064,14 +4133,15 @@ const App = (() => {
       const isWorkflow = artifact.filename.startsWith('.github/');
       let content = artifact.code;
 
-      // Auto-fix: ensure workflow YAML references scripts with artifacts/ prefix
+      // Auto-fix: ensure workflow YAML references scripts with artifact/ prefix
       if (isWorkflow && scriptFilenames.length > 0) {
+        const escapedArtifactDir = config.artifactDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         for (const scriptName of scriptFilenames) {
-          // Match bare script name NOT already prefixed with artifacts/
+          // Match bare script name NOT already prefixed with artifact/
           // Handles patterns like: python3 script.py, python "script.py", node script.js
           const escaped = scriptName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const re = new RegExp(`(?<!artifacts/)(?<![\\w/])${escaped}`, 'g');
-          content = content.replace(re, `artifacts/${scriptName}`);
+          const re = new RegExp(`(?<!${escapedArtifactDir}/)(?<![\\w/])${escaped}`, 'g');
+          content = content.replace(re, `${config.artifactDir}/${scriptName}`);
         }
       }
 
@@ -4107,6 +4177,7 @@ const App = (() => {
         const runtime = GitHubActions.detectRuntime(firstScript.language);
 
         updateStatusCard(statusCard, 'in_progress', 'Triggering workflow…');
+        const dispatchTs = Date.now();
         await GitHubActions.dispatchWorkflow(config, config.workflow, {
           entrypoint: filePath,
           language: runtime,
@@ -4115,15 +4186,16 @@ const App = (() => {
         // Poll for run
         updateStatusCard(statusCard, 'queued', 'Waiting for workflow run…');
         let run = null;
-        for (let attempt = 0; attempt < 6; attempt++) {
-          await new Promise((r) => setTimeout(r, 3000));
-          run = await GitHubActions.findLatestRun(config, config.workflow);
-          if (run && run.status !== 'completed') break;
-          if (run) {
-            const age = Date.now() - new Date(run.created_at).getTime();
-            if (age < 30000) break;
-            run = null;
-          }
+        for (let attempt = 0; attempt < 10; attempt++) {
+          await new Promise((r) => setTimeout(r, 1200));
+          const recentRuns = await GitHubActions.listRecentRuns(config, null, 10);
+          run = recentRuns.find(r => {
+            if (!r) return false;
+            const createdAt = new Date(r.created_at || 0).getTime();
+            const workflowPath = String(r.path || '');
+            return createdAt >= (dispatchTs - 10000) && workflowPath.includes(config.workflow);
+          }) || null;
+          if (run) break;
         }
 
         if (run) {
@@ -4132,7 +4204,7 @@ const App = (() => {
           const finalRun = await GitHubActions.pollRun(config, run.id, (r) => {
             const label = r.status === 'in_progress' ? 'Running…' : r.status === 'queued' ? 'Queued…' : r.status;
             updateStatusCard(statusCard, r.status, label, runUrl);
-          });
+          }, 2000);
 
           try {
             const jobs = await GitHubActions.getRunJobs(config, finalRun.id);
@@ -4454,6 +4526,7 @@ const App = (() => {
 
       // 3. Dispatch workflow
       updateStatusCard(card, 'in_progress', 'Triggering workflow…');
+      const dispatchTs = Date.now();
       await GitHubActions.dispatchWorkflow(config, config.workflow, {
         entrypoint: filePath,
         language: runtime,
@@ -4462,16 +4535,16 @@ const App = (() => {
       // 4. Find the triggered run (with retries)
       updateStatusCard(card, 'queued', 'Waiting for workflow run…');
       let run = null;
-      for (let attempt = 0; attempt < 6; attempt++) {
-        await new Promise((r) => setTimeout(r, 3000));
-        run = await GitHubActions.findLatestRun(config, config.workflow);
-        if (run && run.status !== 'completed') break;
-        // The latest run may be from a previous dispatch; check creation time
-        if (run) {
-          const age = Date.now() - new Date(run.created_at).getTime();
-          if (age < 30000) break; // created within last 30s → it's ours
-          run = null; // too old, keep waiting
-        }
+      for (let attempt = 0; attempt < 10; attempt++) {
+        await new Promise((r) => setTimeout(r, 1200));
+        const recentRuns = await GitHubActions.listRecentRuns(config, null, 10);
+        run = recentRuns.find(r => {
+          if (!r) return false;
+          const createdAt = new Date(r.created_at || 0).getTime();
+          const workflowPath = String(r.path || '');
+          return createdAt >= (dispatchTs - 10000) && workflowPath.includes(config.workflow);
+        }) || null;
+        if (run) break;
       }
 
       if (!run) {
@@ -4489,7 +4562,7 @@ const App = (() => {
       const finalRun = await GitHubActions.pollRun(config, run.id, (r) => {
         const label = r.status === 'in_progress' ? 'Running…' : r.status === 'queued' ? 'Queued…' : r.status;
         updateStatusCard(card, r.status, label, runUrl);
-      });
+      }, 2000);
 
       // 6. Fetch & parse logs
       try {
@@ -5035,6 +5108,7 @@ const App = (() => {
               <input type="password" id="setup-gh-token" class="setup-input" placeholder="ghp_..." autocomplete="off" />
               <button type="button" class="password-toggle setup-toggle3" title="Show/hide">👁</button>
             </div>
+            <div class="setup-hint">${tl('setupGithubPatHint')}</div>
           </div>
           <div class="setup-field">
             <label>${tl('setupGithubOwner')}</label>
